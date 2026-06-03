@@ -183,18 +183,12 @@ class InMemoryCifar:
         images = images.view(local_workers, batch_size, *self.images.shape[1:])
         labels = labels.view(local_workers, batch_size)
         if augment:
-            images = torch.stack(
-                [
-                    deterministic_cifar_augment(
-                        images[local_index],
-                        seed=seed,
-                        epoch=epoch,
-                        step=step,
-                        worker_rank=rank,
-                    )
-                    for local_index, rank in enumerate(worker_ranks)
-                ],
-                dim=0,
+            images = deterministic_cifar_augment_for_workers(
+                images,
+                seed=seed,
+                epoch=epoch,
+                step=step,
+                worker_ranks=worker_ranks,
             )
         images = images.sub(self.mean).div(self.std)
         return images.transpose(0, 1).contiguous(), labels.transpose(0, 1).contiguous()
@@ -293,23 +287,115 @@ def deterministic_cifar_augment(
     crop_size: int = 32,
     flip_p: float = 0.5,
 ) -> Tensor:
+    batch, _, height, width = images.shape
+    max_x = height + 2 * padding - crop_size + 1
+    max_y = width + 2 * padding - crop_size + 1
+
+    x_shifts, y_shifts, flip_mask = _cifar_augmentation_randomness(
+        batch=batch,
+        seed=seed,
+        epoch=epoch,
+        step=step,
+        worker_rank=worker_rank,
+        max_x=max_x,
+        max_y=max_y,
+        flip_p=flip_p,
+        device=images.device,
+    )
+    return _apply_cifar_augment(
+        images,
+        x_shifts=x_shifts,
+        y_shifts=y_shifts,
+        flip_mask=flip_mask,
+        padding=padding,
+        crop_size=crop_size,
+    )
+
+
+def deterministic_cifar_augment_for_workers(
+    images: Tensor,
+    seed: int,
+    epoch: int,
+    worker_ranks: Sequence[int],
+    step: int = 0,
+    padding: int = 4,
+    crop_size: int = 32,
+    flip_p: float = 0.5,
+) -> Tensor:
+    if images.dim() != 5:
+        raise ValueError("expected images with shape (workers, batch, channels, height, width)")
+    local_workers, batch, channels, height, width = images.shape
+    if local_workers != len(worker_ranks):
+        raise ValueError("worker_ranks length must match images.size(0)")
+
+    max_x = height + 2 * padding - crop_size + 1
+    max_y = width + 2 * padding - crop_size + 1
+    random_params = [
+        _cifar_augmentation_randomness(
+            batch=batch,
+            seed=seed,
+            epoch=epoch,
+            step=step,
+            worker_rank=rank,
+            max_x=max_x,
+            max_y=max_y,
+            flip_p=flip_p,
+            device=images.device,
+        )
+        for rank in worker_ranks
+    ]
+    x_shifts = torch.stack([params[0] for params in random_params], dim=0).flatten()
+    y_shifts = torch.stack([params[1] for params in random_params], dim=0).flatten()
+    flip_mask = torch.stack([params[2] for params in random_params], dim=0).flatten()
+    augmented = _apply_cifar_augment(
+        images.reshape(local_workers * batch, channels, height, width),
+        x_shifts=x_shifts,
+        y_shifts=y_shifts,
+        flip_mask=flip_mask,
+        padding=padding,
+        crop_size=crop_size,
+    )
+    return augmented.view(local_workers, batch, channels, crop_size, crop_size)
+
+
+def _cifar_augmentation_randomness(
+    *,
+    batch: int,
+    seed: int,
+    epoch: int,
+    step: int,
+    worker_rank: int | Tensor,
+    max_x: int,
+    max_y: int,
+    flip_p: float,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor]:
     generator = torch.Generator(device="cpu")
     if isinstance(worker_rank, int):
         worker_offset = worker_rank * 10_007
     else:
         worker_offset = 0
     generator.manual_seed(seed + epoch * 1_000_003 + step * 100_003 + worker_offset)
-    batch, channels, height, width = images.shape
-    padded = F.pad(images, (padding, padding, padding, padding))
-    max_x = height + 2 * padding - crop_size + 1
-    max_y = width + 2 * padding - crop_size + 1
-    x_shifts = torch.randint(max_x, (batch,), generator=generator).to(images.device)
-    y_shifts = torch.randint(max_y, (batch,), generator=generator).to(images.device)
-    flip_mask = torch.rand(batch, generator=generator).to(images.device) < flip_p
+    x_shifts = torch.randint(max_x, (batch,), generator=generator).to(device)
+    y_shifts = torch.randint(max_y, (batch,), generator=generator).to(device)
+    flip_mask = torch.rand(batch, generator=generator).to(device) < flip_p
     if isinstance(worker_rank, Tensor):
-        x_shifts = (x_shifts + worker_rank.to(device=images.device) * 3) % max_x
-        y_shifts = (y_shifts + worker_rank.to(device=images.device) * 5) % max_y
+        x_shifts = (x_shifts + worker_rank.to(device=device) * 3) % max_x
+        y_shifts = (y_shifts + worker_rank.to(device=device) * 5) % max_y
+    return x_shifts, y_shifts, flip_mask
 
+
+def _apply_cifar_augment(
+    images: Tensor,
+    *,
+    x_shifts: Tensor,
+    y_shifts: Tensor,
+    flip_mask: Tensor,
+    padding: int,
+    crop_size: int,
+) -> Tensor:
+    batch = images.size(0)
+    padded = F.pad(images, (padding, padding, padding, padding))
     batch_index = torch.arange(batch, device=images.device).view(batch, 1, 1)
     y_index = torch.arange(crop_size, device=images.device).view(1, crop_size, 1) + x_shifts.view(
         batch, 1, 1
