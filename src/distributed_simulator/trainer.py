@@ -28,6 +28,7 @@ from distributed_simulator.topology import communication_schedule, groups_for_ra
 _FOREACH_ADD = "_foreach_add"
 _FOREACH_ADD_INPLACE = "_foreach_add_"
 _FOREACH_MUL_INPLACE = "_foreach_mul_"
+_EVALUATION_INTERVAL_EPOCHS = 5
 
 
 @dataclass(frozen=True)
@@ -193,19 +194,20 @@ class DecentralizedTrainer:
                 epoch = (step + 1) // self.batches_per_epoch
                 epoch_losses = losses[-self.batches_per_epoch :]
                 train_loss = torch.stack(epoch_losses).mean().item()
-                metrics = self._evaluate_epoch(epoch, train_loss, current_lr)
-                history.append(metrics)
-                if self.ctx.rank == 0:
-                    logger.info(
-                        "epoch={} train_loss={:.6f} test_loss={:.6f} "
-                        "test_acc={:.4f} d2c={:.6f} lr={:.6g}",
-                        metrics.epoch,
-                        metrics.train_loss,
-                        metrics.test_loss,
-                        metrics.test_accuracy,
-                        metrics.distance_to_consensus,
-                        metrics.lr,
-                    )
+                if self._should_evaluate_epoch(epoch):
+                    metrics = self._evaluate_epoch(epoch, train_loss, current_lr)
+                    history.append(metrics)
+                    if self.ctx.rank == 0:
+                        logger.info(
+                            "epoch={} train_loss={:.6f} test_loss={:.6f} "
+                            "test_acc={:.4f} d2c={:.6f} lr={:.6g}",
+                            metrics.epoch,
+                            metrics.train_loss,
+                            metrics.test_loss,
+                            metrics.test_accuracy,
+                            metrics.distance_to_consensus,
+                            metrics.lr,
+                        )
 
         final_metrics = history[-1] if history else self._evaluate_epoch(0, 0.0, 0.0)
         local_loss = torch.stack(losses).mean().item() if losses else 0.0
@@ -576,6 +578,9 @@ class DecentralizedTrainer:
             return 0
         return self.cfg.scheduler.warmup_epochs * self.batches_per_epoch
 
+    def _should_evaluate_epoch(self, epoch: int) -> bool:
+        return epoch % _EVALUATION_INTERVAL_EPOCHS == 0 or epoch == self.cfg.epochs
+
     def _next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         epoch = self.training_step // self.batches_per_epoch
         step = self.training_step % self.batches_per_epoch
@@ -637,7 +642,8 @@ class DecentralizedTrainer:
         try:
             self.param_storage.copy_(global_vector.expand_as(self.param_storage))
             self.model.sync_parameters_from_storage_()
-            self._average_packed_buffers_()
+            self._calibrate_average_model_batchnorm_(epoch)
+            self.model.eval()
             for step in range(self.test_batches_per_epoch):
                 inputs, targets = self._batch_from_dataset(
                     self.test_dataset,
@@ -673,6 +679,33 @@ class DecentralizedTrainer:
             distance_to_consensus=d2c,
             lr=lr,
         )
+
+    @torch.no_grad()
+    def _calibrate_average_model_batchnorm_(self, epoch: int) -> None:
+        assert self.model is not None
+        if not self._model_has_norm_module():
+            return
+        self._reset_batchnorm_running_stats_()
+        self.model.train(True)
+        calibration_epoch = max(epoch - 1, 0)
+        for step in range(self.batches_per_epoch):
+            inputs, _ = self._batch_from_dataset(
+                self.dataset,
+                epoch=calibration_epoch,
+                step=step,
+                seed=self.cfg.data.seed,
+                augment=self.cfg.data.augment,
+            )
+            with self._autocast_context():
+                self._forward_model(inputs)
+        self._average_packed_buffers_()
+
+    @torch.no_grad()
+    def _reset_batchnorm_running_stats_(self) -> None:
+        assert self.model is not None
+        for module in self.model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.reset_running_stats()
 
     def _local_vectors(self) -> torch.Tensor:
         assert self.param_storage is not None

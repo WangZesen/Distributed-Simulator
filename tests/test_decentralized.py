@@ -295,7 +295,7 @@ def test_warmup_epochs_are_converted_to_update_steps() -> None:
     assert trainer._learning_rate(4) == 0.2
 
 
-def test_training_history_records_metrics_for_every_epoch() -> None:
+def test_training_history_records_scheduled_evaluations() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
         topology=Topology.COMPLETE,
@@ -306,8 +306,8 @@ def test_training_history_records_metrics_for_every_epoch() -> None:
     )
     metrics = DecentralizedTrainer(cfg, ProcessContext()).train()
 
-    assert len(metrics.history) == 2
-    assert [item.epoch for item in metrics.history] == [1, 2]
+    assert len(metrics.history) == 1
+    assert [item.epoch for item in metrics.history] == [2]
     assert all(torch.isfinite(torch.tensor(item.train_loss)) for item in metrics.history)
     assert all(torch.isfinite(torch.tensor(item.test_loss)) for item in metrics.history)
     assert all(0.0 <= item.test_accuracy <= 1.0 for item in metrics.history)
@@ -449,6 +449,52 @@ def test_evaluation_uses_global_averaged_model() -> None:
     metrics = trainer._evaluate_epoch(epoch=1, train_loss=0.0, lr=0.0)
 
     assert torch.allclose(torch.tensor(metrics.test_loss), torch.log(torch.tensor(2.0)))
+
+
+def test_evaluation_runs_every_five_epochs_and_final_epoch() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        topology=Topology.COMPLETE,
+        epochs=7,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+
+    evaluated_epochs = [
+        epoch for epoch in range(1, cfg.epochs + 1) if trainer._should_evaluate_epoch(epoch)
+    ]
+
+    assert evaluated_epochs == [5, 7]
+
+
+def test_evaluation_calibrates_batchnorm_before_testing(monkeypatch) -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        topology=Topology.COMPLETE,
+        epochs=1,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(
+            dataset=DatasetName.SYNTHETIC,
+            batch_size=2,
+            eval_batch_size=8,
+            num_classes=2,
+        ),
+        runtime=RuntimeConfig(amp=False),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    calibrated_epochs = []
+
+    def record_calibration(epoch: int) -> None:
+        calibrated_epochs.append(epoch)
+
+    monkeypatch.setattr(trainer, "_calibrate_average_model_batchnorm_", record_calibration)
+
+    trainer._evaluate_epoch(epoch=1, train_loss=0.0, lr=0.0)
+
+    assert calibrated_epochs == [1]
 
 
 def test_eval_batch_size_is_capped_to_worker_shard_size() -> None:
