@@ -25,7 +25,9 @@ from distributed_simulator.parameters import average_distance_to_consensus
 from distributed_simulator.scheduler import lr_factor
 from distributed_simulator.topology import communication_schedule, groups_for_rank
 
+_FOREACH_ADD = "_foreach_add"
 _FOREACH_ADD_INPLACE = "_foreach_add_"
+_FOREACH_MUL_INPLACE = "_foreach_mul_"
 
 
 @dataclass(frozen=True)
@@ -346,35 +348,52 @@ class DecentralizedTrainer:
         weight_decay: float,
         momentum: float,
     ) -> None:
-        for parameter, gradient in zip(
-            self.active_decay_parameters,
-            self.active_decay_gradients,
-            strict=True,
-        ):
-            update = gradient.add(parameter, alpha=weight_decay) if weight_decay else gradient
-            buffer = self._momentum_buffer(parameter, update)
-            parameter.add_(buffer, alpha=-lr)
+        if self.active_decay_parameters:
+            updates = self.active_decay_gradients
+            if weight_decay:
+                updates = _foreach_add(
+                    self.active_decay_gradients,
+                    self.active_decay_parameters,
+                    alpha=weight_decay,
+                )
+            buffers = self._momentum_buffers(
+                self.active_decay_parameters,
+                updates,
+                momentum=momentum,
+            )
+            _foreach_add_(self.active_decay_parameters, buffers, alpha=-lr)
 
-        for parameter, gradient in zip(
-            self.active_no_decay_parameters,
-            self.active_no_decay_gradients,
-            strict=True,
-        ):
-            buffer = self._momentum_buffer(parameter, gradient)
-            parameter.add_(buffer, alpha=-lr)
+        if self.active_no_decay_parameters:
+            buffers = self._momentum_buffers(
+                self.active_no_decay_parameters,
+                self.active_no_decay_gradients,
+                momentum=momentum,
+            )
+            _foreach_add_(self.active_no_decay_parameters, buffers, alpha=-lr)
 
-    def _momentum_buffer(
+    def _momentum_buffers(
         self,
-        parameter: torch.Tensor,
-        update: torch.Tensor,
-    ) -> torch.Tensor:
-        buffer = self.momentum_buffers.get(id(parameter))
-        if buffer is None:
-            buffer = update.detach().clone(memory_format=torch.preserve_format)
-            self.momentum_buffers[id(parameter)] = buffer
-            return buffer
-        buffer.mul_(self.cfg.optimizer.momentum).add_(update)
-        return buffer
+        parameters: list[torch.Tensor],
+        updates: list[torch.Tensor],
+        momentum: float,
+    ) -> list[torch.Tensor]:
+        buffers = []
+        existing_buffers = []
+        existing_updates = []
+        for parameter, update in zip(parameters, updates, strict=True):
+            buffer = self.momentum_buffers.get(id(parameter))
+            if buffer is None:
+                buffer = update.detach().clone(memory_format=torch.preserve_format)
+                self.momentum_buffers[id(parameter)] = buffer
+            else:
+                existing_buffers.append(buffer)
+                existing_updates.append(update)
+            buffers.append(buffer)
+
+        if existing_buffers:
+            _foreach_mul_(existing_buffers, momentum)
+            _foreach_add_(existing_buffers, existing_updates, alpha=1.0)
+        return buffers
 
     def _active_peer_by_rank(self, step: int) -> dict[int, int]:
         peer_by_rank = {}
@@ -728,3 +747,17 @@ def _foreach_add_(
 ) -> None:
     foreach_add = cast(Any, getattr(torch, _FOREACH_ADD_INPLACE))
     foreach_add(tensors, others, alpha=alpha)
+
+
+def _foreach_add(
+    tensors: list[torch.Tensor],
+    others: list[torch.Tensor],
+    alpha: float,
+) -> list[torch.Tensor]:
+    foreach_add = cast(Any, getattr(torch, _FOREACH_ADD))
+    return foreach_add(tensors, others, alpha=alpha)
+
+
+def _foreach_mul_(tensors: list[torch.Tensor], scalar: float) -> None:
+    foreach_mul = cast(Any, getattr(torch, _FOREACH_MUL_INPLACE))
+    foreach_mul(tensors, scalar)
