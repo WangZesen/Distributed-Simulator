@@ -15,7 +15,7 @@ from distributed_simulator.config import (
     WarmupCosineSchedulerConfig,
 )
 from distributed_simulator.data import DatasetName, deterministic_worker_indices
-from distributed_simulator.distributed import ProcessContext
+from distributed_simulator.distributed import ProcessContext, resolve_process_device
 from distributed_simulator.model import ModelName
 from distributed_simulator.trainer import DecentralizedTrainer
 
@@ -76,6 +76,30 @@ def test_decentralized_trainer_uses_packed_storage() -> None:
     assert trainer._local_vectors() is trainer.param_storage
     assert trainer.model is not None
     assert hasattr(trainer.model, "parameter_storage_layout")
+
+
+def test_resolve_process_device_maps_cuda_to_local_rank(monkeypatch) -> None:
+    selected_devices = []
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", selected_devices.append)
+
+    device = resolve_process_device("cuda")
+
+    assert device == torch.device("cuda:1")
+    assert selected_devices == [torch.device("cuda:1")]
+
+
+def test_resolve_process_device_keeps_explicit_cuda_index(monkeypatch) -> None:
+    selected_devices = []
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", selected_devices.append)
+
+    device = resolve_process_device("cuda:0")
+
+    assert device == torch.device("cuda:0")
+    assert selected_devices == [torch.device("cuda:0")]
 
 
 def test_complete_mix_happens_before_optimizer_update() -> None:

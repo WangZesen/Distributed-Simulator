@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -23,10 +24,6 @@ def init_process_context(device: torch.device) -> ProcessContext:
     if not dist.is_available():
         return ProcessContext()
 
-    # torchrun sets RANK, WORLD_SIZE, MASTER_ADDR, and MASTER_PORT. env:// lets
-    # local CPU smoke tests use the same entry point as GPU jobs.
-    import os
-
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size == 1:
         return ProcessContext()
@@ -39,6 +36,20 @@ def init_process_context(device: torch.device) -> ProcessContext:
 def destroy_process_context() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+
+def resolve_process_device(requested_device: str | torch.device) -> torch.device:
+    device = torch.device(requested_device)
+    if device.type != "cuda":
+        return device
+
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None and device.index is None:
+        device = torch.device(f"cuda:{int(local_rank)}")
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+    return device
 
 
 def all_gather_owned_buckets(local_buckets: torch.Tensor, ctx: ProcessContext) -> torch.Tensor:

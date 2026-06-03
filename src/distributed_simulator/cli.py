@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-import torch
 from loguru import logger
 
 from distributed_simulator.config import (
@@ -17,7 +16,11 @@ from distributed_simulator.config import (
     WarmupCosineSchedulerConfig,
 )
 from distributed_simulator.data import DatasetName
-from distributed_simulator.distributed import destroy_process_context, init_process_context
+from distributed_simulator.distributed import (
+    destroy_process_context,
+    init_process_context,
+    resolve_process_device,
+)
 from distributed_simulator.model import ModelName
 from distributed_simulator.trainer import DecentralizedTrainer
 
@@ -128,7 +131,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     configure_logging(args.log_level)
     cfg = config_from_args(args)
-    device = torch.device(cfg.device)
+    device = resolve_process_device(cfg.device)
     ctx = init_process_context(device)
     try:
         run_cfg = cfg.model_copy(update={"device": str(device)})
