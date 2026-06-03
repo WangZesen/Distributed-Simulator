@@ -47,7 +47,7 @@ def resolve_process_device(requested_device: str | torch.device) -> torch.device
     if local_rank is not None and device.index is None:
         device = torch.device(f"cuda:{int(local_rank)}")
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and device.index is not None:
         torch.cuda.set_device(device)
     return device
 

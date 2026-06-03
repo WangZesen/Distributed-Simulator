@@ -70,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="default",
         help="torch.compile optimization mode.",
     )
+    parser.add_argument(
+        "--no-overlap-mixing",
+        action="store_true",
+        help="Disable CUDA stream overlap between model mixing and gradient computation.",
+    )
     parser.add_argument("--classes", type=int, default=3)
     parser.add_argument("--log-level", default="INFO", help="Loguru log level.")
     return parser
@@ -111,6 +116,7 @@ def config_from_args(args: argparse.Namespace) -> DecentralizedConfig:
         amp_dtype="bf16",
         compile=args.compile,
         compile_mode=args.compile_mode,
+        overlap_mixing=not args.no_overlap_mixing,
     )
     return DecentralizedConfig(
         virtual_workers=args.workers,

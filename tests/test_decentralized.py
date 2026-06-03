@@ -102,6 +102,18 @@ def test_resolve_process_device_keeps_explicit_cuda_index(monkeypatch) -> None:
     assert selected_devices == [torch.device("cuda:0")]
 
 
+def test_resolve_process_device_leaves_single_process_cuda_unindexed(monkeypatch) -> None:
+    selected_devices = []
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", selected_devices.append)
+
+    device = resolve_process_device("cuda")
+
+    assert device == torch.device("cuda")
+    assert selected_devices == []
+
+
 def test_complete_mix_happens_before_optimizer_update() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,

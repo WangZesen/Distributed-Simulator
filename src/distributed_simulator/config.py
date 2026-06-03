@@ -63,6 +63,7 @@ class RuntimeConfig(_ConfigModel):
     amp_dtype: Literal["bf16"] = "bf16"
     compile: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
+    overlap_mixing: bool = True
 
 
 class DecentralizedConfig(_ConfigModel):

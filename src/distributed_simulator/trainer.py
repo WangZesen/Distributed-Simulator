@@ -55,6 +55,24 @@ class TrainMetrics:
     history: tuple[EpochMetrics, ...]
 
 
+@dataclass
+class PendingPairwiseExchange:
+    recv_by_process: dict[int, list[int]]
+    recv_tensors: dict[int, torch.Tensor]
+    works: list[dist.Work]
+    send_tensors: list[torch.Tensor]
+
+
+@dataclass
+class PendingMix:
+    stream: torch.cuda.Stream | None
+    vectors: torch.Tensor
+    mixed: torch.Tensor | None = None
+    all_reduce_work: dist.Work | None = None
+    pairwise_peer_by_rank: dict[int, int] | None = None
+    pairwise_exchange: PendingPairwiseExchange | None = None
+
+
 class PackedStorageEntry(Protocol):
     name: str
     module_name: str
@@ -132,12 +150,14 @@ class DecentralizedTrainer:
         self.momentum_buffers: dict[int, torch.Tensor] = {}
         self._init_packed_model()
         logger.info(
-            "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} backend=packed",
+            "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} "
+            "overlap_mixing={} backend=packed",
             self.ctx.rank,
             self._amp_enabled(),
             self.cfg.runtime.amp_dtype,
             self.cfg.runtime.compile,
             self.cfg.runtime.compile_mode,
+            self.cfg.runtime.overlap_mixing,
         )
         logger.debug(
             "Rank {} owns virtual workers {} on {}",
@@ -159,8 +179,13 @@ class DecentralizedTrainer:
         history = []
         for step in range(self.total_steps):
             self.training_step = step
-            loss = self._compute_local_gradients()
-            self._mix_parameters(step)
+            if self._use_cuda_mixing_overlap():
+                pending_mix = self._start_mixing(step)
+                loss = self._compute_local_gradients()
+                self._finish_mixing(pending_mix)
+            else:
+                loss = self._compute_local_gradients()
+                self._mix_parameters(step)
             current_lr = self._learning_rate(step)
             self._apply_optimizer_update(current_lr)
             losses.append(loss.detach())
@@ -221,14 +246,91 @@ class DecentralizedTrainer:
 
     @torch.no_grad()
     def _mix_parameters(self, step: int) -> None:
+        self._finish_mixing(self._start_mixing(step, overlap=False))
+
+    @torch.no_grad()
+    def _start_mixing(self, step: int, overlap: bool | None = None) -> PendingMix:
+        assert self.model is not None
+        use_overlap = self._use_cuda_mixing_overlap() if overlap is None else overlap
+        if not use_overlap:
+            return self._start_mixing_on_current_stream(step, stream=None)
+
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            return self._start_mixing_on_current_stream(step, stream=stream)
+
+    @torch.no_grad()
+    def _start_mixing_on_current_stream(
+        self,
+        step: int,
+        stream: torch.cuda.Stream | None,
+    ) -> PendingMix:
         assert self.model is not None
         self.model.sync_storage_from_parameters_()
         vectors = self._local_vectors()
         if self.cfg.topology == Topology.COMPLETE:
-            mixed = self._complete_graph_mix(vectors)
-        else:
-            mixed = self._pairwise_topology_mix(vectors, step)
+            return self._start_complete_graph_mix(vectors, stream=stream)
+        return self._start_pairwise_topology_mix(vectors, step=step, stream=stream)
+
+    @torch.no_grad()
+    def _finish_mixing(self, pending: PendingMix) -> None:
+        if pending.stream is not None:
+            torch.cuda.current_stream(self.device).wait_stream(pending.stream)
+
+        mixed = self._finish_mixed_vectors(pending)
         self._load_local_vectors_(mixed)
+
+    @torch.no_grad()
+    def _finish_mixed_vectors(self, pending: PendingMix) -> torch.Tensor:
+        if pending.all_reduce_work is not None:
+            pending.all_reduce_work.wait()
+            mean = pending.vectors
+            mean.div_(self.ctx.world_size)
+            return mean.expand(self.local_worker_count, -1).clone()
+        if pending.pairwise_exchange is not None and pending.pairwise_peer_by_rank is not None:
+            remote_peer_vectors = self._finish_remote_peer_exchange(pending.pairwise_exchange)
+            return self._finish_pairwise_topology_mix(
+                pending.vectors,
+                pending.pairwise_peer_by_rank,
+                remote_peer_vectors,
+            )
+        assert pending.mixed is not None
+        return pending.mixed
+
+    @torch.no_grad()
+    def _start_complete_graph_mix(
+        self,
+        local_vectors: torch.Tensor,
+        stream: torch.cuda.Stream | None,
+    ) -> PendingMix:
+        local_mean = local_vectors.mean(dim=0)
+        if not self.ctx.is_distributed:
+            mixed = local_mean.expand_as(local_vectors).clone()
+            return PendingMix(stream=stream, vectors=local_vectors, mixed=mixed)
+
+        logger.debug("Rank {} mixing complete topology with one all-reduce", self.ctx.rank)
+        work = dist.all_reduce(local_mean, op=dist.ReduceOp.SUM, async_op=True)
+        return PendingMix(stream=stream, vectors=local_mean, all_reduce_work=work)
+
+    @torch.no_grad()
+    def _start_pairwise_topology_mix(
+        self,
+        local_vectors: torch.Tensor,
+        step: int,
+        stream: torch.cuda.Stream | None,
+    ) -> PendingMix:
+        peer_by_rank = self._active_peer_by_rank(step)
+        exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
+        if exchange is None:
+            mixed = self._finish_pairwise_topology_mix(local_vectors, peer_by_rank, {})
+            return PendingMix(stream=stream, vectors=local_vectors, mixed=mixed)
+        return PendingMix(
+            stream=stream,
+            vectors=local_vectors,
+            pairwise_peer_by_rank=peer_by_rank,
+            pairwise_exchange=exchange,
+        )
 
     @torch.no_grad()
     def _complete_graph_mix(self, local_vectors: torch.Tensor) -> torch.Tensor:
@@ -244,10 +346,20 @@ class DecentralizedTrainer:
     @torch.no_grad()
     def _pairwise_topology_mix(self, local_vectors: torch.Tensor, step: int) -> torch.Tensor:
         peer_by_rank = self._active_peer_by_rank(step)
+        exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
+        remote_peer_vectors = self._finish_remote_peer_exchange(exchange) if exchange else {}
+        return self._finish_pairwise_topology_mix(local_vectors, peer_by_rank, remote_peer_vectors)
+
+    @torch.no_grad()
+    def _finish_pairwise_topology_mix(
+        self,
+        local_vectors: torch.Tensor,
+        peer_by_rank: dict[int, int],
+        remote_peer_vectors: dict[int, torch.Tensor],
+    ) -> torch.Tensor:
         local_by_rank = {rank: i for i, rank in enumerate(self.owned_ranks)}
         peer_vectors = torch.empty_like(local_vectors)
 
-        remote_peer_vectors = self._exchange_remote_peer_vectors(local_vectors, peer_by_rank)
         for local_index, rank in enumerate(self.owned_ranks):
             peer = peer_by_rank[rank]
             if peer == rank:
@@ -267,6 +379,18 @@ class DecentralizedTrainer:
         if not self.ctx.is_distributed:
             return {}
 
+        exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
+        return self._finish_remote_peer_exchange(exchange) if exchange else {}
+
+    @torch.no_grad()
+    def _start_remote_peer_exchange(
+        self,
+        local_vectors: torch.Tensor,
+        peer_by_rank: dict[int, int],
+    ) -> PendingPairwiseExchange | None:
+        if not self.ctx.is_distributed:
+            return None
+
         local_by_rank = {rank: i for i, rank in enumerate(self.owned_ranks)}
         send_by_process: dict[int, list[int]] = {}
         recv_by_process: dict[int, list[int]] = {}
@@ -281,14 +405,16 @@ class DecentralizedTrainer:
 
         ops: list[dist.P2POp] = []
         recv_tensors: dict[int, torch.Tensor] = {}
+        send_tensors: list[torch.Tensor] = []
         for process in sorted(set(send_by_process) | set(recv_by_process)):
             send_ranks = sorted(send_by_process.get(process, []))
             recv_ranks = sorted(recv_by_process.get(process, []))
             if send_ranks:
                 send_tensor = torch.stack(
                     [local_vectors[local_by_rank[rank]] for rank in send_ranks]
-                )
-                ops.append(dist.P2POp(dist.isend, send_tensor.contiguous(), process))
+                ).contiguous()
+                send_tensors.append(send_tensor)
+                ops.append(dist.P2POp(dist.isend, send_tensor, process))
             if recv_ranks:
                 recv_tensor = torch.empty(
                     len(recv_ranks),
@@ -305,12 +431,25 @@ class DecentralizedTrainer:
                 self.ctx.rank,
                 len(set(send_by_process) | set(recv_by_process)),
             )
-            for work in dist.batch_isend_irecv(ops):
-                work.wait()
+            works = list(dist.batch_isend_irecv(ops))
+            return PendingPairwiseExchange(
+                recv_by_process=recv_by_process,
+                recv_tensors=recv_tensors,
+                works=works,
+                send_tensors=send_tensors,
+            )
+        return None
 
+    @torch.no_grad()
+    def _finish_remote_peer_exchange(
+        self,
+        exchange: PendingPairwiseExchange,
+    ) -> dict[int, torch.Tensor]:
+        for work in exchange.works:
+            work.wait()
         remote_vectors: dict[int, torch.Tensor] = {}
-        for process, tensor in recv_tensors.items():
-            for rank, vector in zip(sorted(recv_by_process[process]), tensor, strict=True):
+        for process, tensor in exchange.recv_tensors.items():
+            for rank, vector in zip(sorted(exchange.recv_by_process[process]), tensor, strict=True):
                 remote_vectors[rank] = vector
         return remote_vectors
 
@@ -698,6 +837,13 @@ class DecentralizedTrainer:
 
     def _use_cuda_amp_batched_autograd(self) -> bool:
         return False
+
+    def _use_cuda_mixing_overlap(self) -> bool:
+        return (
+            self.cfg.runtime.overlap_mixing
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
 
     def _packed_storage_value(self, name: str) -> torch.Tensor:
         assert self.model is not None and self.param_storage is not None
