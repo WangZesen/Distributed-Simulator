@@ -1,0 +1,3 @@
+[submodule "external/Packed-ResNet"]
+	path = external/Packed-ResNet
+	url = git@github.com:WangZesen/Packed-ResNet.git

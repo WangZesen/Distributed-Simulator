@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+.venv-*/
+
+# Local data and logs
+data/
+logs/
+
+# Ignore reference implementation
+reference/
