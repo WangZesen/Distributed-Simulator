@@ -1,6 +1,7 @@
 from distributed_simulator.trainers import (
     DecentralizedTrainer,
     EpochMetrics,
+    SAMTrainer,
     SyncTrainer,
     TrainMetrics,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "EpochMetrics",
     "InMemoryCifar",
     "InMemorySyntheticImages",
+    "SAMTrainer",
     "SyncTrainer",
     "TrainMetrics",
     "dist",

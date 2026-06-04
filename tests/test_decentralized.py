@@ -783,12 +783,20 @@ def test_eval_batch_size_is_capped_to_worker_shard_size() -> None:
     assert trainer.test_batches_per_epoch == 1
 
 
-def test_cli_cpu_smoke_single_process() -> None:
+def test_cli_cpu_smoke_single_process(tmp_path) -> None:
+    config = tmp_path / "runtime.toml"
+    config.write_text(
+        """
+[runtime]
+compile = false
+""",
+    )
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "distributed_simulator.cli",
+            str(config),
             "--dataset",
             "synthetic",
             "--model",
@@ -816,6 +824,9 @@ def test_cli_cpu_smoke_adaptive_mix(tmp_path) -> None:
     config = tmp_path / "adaptive.toml"
     config.write_text(
         """
+[runtime]
+compile = false
+
 [trainer]
 name = "decentralized"
 topology = "complete"
@@ -861,6 +872,9 @@ def test_cli_sync_cpu_smoke_single_process(tmp_path) -> None:
     config = tmp_path / "sync.toml"
     config.write_text(
         """
+[runtime]
+compile = false
+
 [trainer]
 name = "sync"
 """,
@@ -894,7 +908,14 @@ name = "sync"
     assert "epochs=1" in result.stdout
 
 
-def test_cli_cpu_smoke_torchrun_two_processes() -> None:
+def test_cli_cpu_smoke_torchrun_two_processes(tmp_path) -> None:
+    config = tmp_path / "runtime.toml"
+    config.write_text(
+        """
+[runtime]
+compile = false
+""",
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -904,6 +925,7 @@ def test_cli_cpu_smoke_torchrun_two_processes() -> None:
             "--nproc-per-node=2",
             "-m",
             "distributed_simulator.cli",
+            str(config),
             "--dataset",
             "synthetic",
             "--model",
@@ -932,6 +954,9 @@ def test_cli_sync_cpu_smoke_torchrun_two_processes(tmp_path) -> None:
     config = tmp_path / "sync.toml"
     config.write_text(
         """
+[runtime]
+compile = false
+
 [trainer]
 name = "sync"
 """,

@@ -15,7 +15,12 @@ from distributed_simulator.config import (
 )
 from distributed_simulator.data import DatasetName
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainers import DecentralizedTrainer, SyncTrainer, TrainMetrics
+from distributed_simulator.trainers import (
+    DecentralizedTrainer,
+    SAMTrainer,
+    SyncTrainer,
+    TrainMetrics,
+)
 
 __all__ = [
     "ConstantSchedulerConfig",
@@ -27,6 +32,7 @@ __all__ = [
     "ModelConfig",
     "ModelName",
     "OptimizerConfig",
+    "SAMTrainer",
     "SAMTrainerConfig",
     "SimulationConfig",
     "SyncTrainerConfig",

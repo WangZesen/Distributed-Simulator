@@ -9,6 +9,7 @@ from loguru import logger
 
 from distributed_simulator.config import (
     DecentralizedTrainerConfig,
+    SAMTrainerConfig,
     SimulationConfig,
     SyncTrainerConfig,
     config_from_files_and_overrides,
@@ -20,7 +21,7 @@ from distributed_simulator.distributed import (
     resolve_process_device,
 )
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainers import DecentralizedTrainer, SyncTrainer
+from distributed_simulator.trainers import DecentralizedTrainer, SAMTrainer, SyncTrainer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,12 +92,16 @@ def build_trainer(cfg: SimulationConfig, ctx):  # noqa: ANN001, ANN201
         return DecentralizedTrainer(cfg, ctx)
     if isinstance(trainer_cfg, SyncTrainerConfig):
         return SyncTrainer(cfg, ctx)
+    if isinstance(trainer_cfg, SAMTrainerConfig):
+        return SAMTrainer(cfg, ctx)
     raise ValueError(f"CLI does not support trainer: {trainer_cfg.name}")
 
 
 def _trainer_summary_fields(trainer_cfg: object) -> str:
     if isinstance(trainer_cfg, DecentralizedTrainerConfig):
         return f"topology={trainer_cfg.topology.value} mix={trainer_cfg.mix.name} "
+    if isinstance(trainer_cfg, SAMTrainerConfig):
+        return f"rho={trainer_cfg.rho:g} "
     return ""
 
 

@@ -109,6 +109,7 @@ class SyncTrainerConfig(_ConfigModel):
 
 class SAMTrainerConfig(_ConfigModel):
     name: Literal["sam"] = "sam"
+    rho: float = Field(default=0.05, ge=0.0)
 
 
 TrainerConfig = DecentralizedTrainerConfig | SyncTrainerConfig | SAMTrainerConfig
