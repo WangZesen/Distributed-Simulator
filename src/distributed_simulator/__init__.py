@@ -15,7 +15,7 @@ from distributed_simulator.config import (
 )
 from distributed_simulator.data import DatasetName
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainer import DecentralizedTrainer, TrainMetrics
+from distributed_simulator.trainers import DecentralizedTrainer, SyncTrainer, TrainMetrics
 
 __all__ = [
     "ConstantSchedulerConfig",
@@ -30,6 +30,7 @@ __all__ = [
     "SAMTrainerConfig",
     "SimulationConfig",
     "SyncTrainerConfig",
+    "SyncTrainer",
     "TrainMetrics",
     "TrainerName",
     "WarmupCosineSchedulerConfig",

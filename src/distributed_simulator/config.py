@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -184,3 +185,38 @@ class DecentralizedConfig(SimulationConfig):
 def _require_power_of_two(value: int, name: str) -> None:
     if value < 1 or value & (value - 1):
         raise ValueError(f"{name} must be a positive power of two, got {value}")
+
+
+def merge_dicts_recursive(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge config dictionaries with later values taking precedence."""
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict) and not _changes_named_block(
+            current,
+            value,
+        ):
+            merged[key] = merge_dicts_recursive(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config_files(paths: list[str | Path] | tuple[str | Path, ...]) -> SimulationConfig:
+    return config_from_files_and_overrides(paths, {})
+
+
+def config_from_files_and_overrides(
+    paths: list[str | Path] | tuple[str | Path, ...],
+    overrides: dict[str, Any],
+) -> SimulationConfig:
+    data: dict[str, Any] = {}
+    for path in paths:
+        with Path(path).open("rb") as file:
+            data = merge_dicts_recursive(data, tomllib.load(file))
+    data = merge_dicts_recursive(data, overrides)
+    return SimulationConfig.model_validate(data)
+
+
+def _changes_named_block(current: dict[str, Any], override: dict[str, Any]) -> bool:
+    return "name" in current and "name" in override and current["name"] != override["name"]

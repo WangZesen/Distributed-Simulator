@@ -8,8 +8,11 @@ from distributed_simulator.config import (
     DecentralizedTrainerConfig,
     NormalMixConfig,
     SimulationConfig,
+    SyncTrainerConfig,
     Topology,
     WarmupCosineSchedulerConfig,
+    config_from_files_and_overrides,
+    merge_dicts_recursive,
 )
 from distributed_simulator.data import (
     DatasetName,
@@ -328,3 +331,61 @@ def test_decentralized_config_accepts_adaptive_mix() -> None:
     assert cfg.trainer.mix.max_gamma == 0.8
     assert cfg.trainer.mix.min_gamma == 0.2
     assert cfg.trainer.mix.start_epoch == 3
+
+
+def test_merge_dicts_recursive_replaces_named_blocks_when_name_changes() -> None:
+    merged = merge_dicts_recursive(
+        {
+            "trainer": {
+                "name": "decentralized",
+                "topology": "ring",
+                "mix": {"name": "adaptive", "p": 2.0},
+            }
+        },
+        {"trainer": {"name": "sync"}},
+    )
+
+    assert merged == {"trainer": {"name": "sync"}}
+
+
+def test_config_files_merge_in_order_and_cli_overrides_apply_last(tmp_path) -> None:
+    base = tmp_path / "base.toml"
+    override = tmp_path / "override.toml"
+    base.write_text(
+        """
+virtual_workers = 8
+epochs = 5
+device = "cuda"
+
+[model]
+name = "linear"
+
+[data]
+dataset = "synthetic"
+batch_size = 4
+num_classes = 3
+
+[trainer]
+name = "decentralized"
+topology = "ring"
+""",
+    )
+    override.write_text(
+        """
+epochs = 2
+
+[trainer]
+name = "sync"
+""",
+    )
+
+    cfg = config_from_files_and_overrides(
+        [base, override],
+        {"device": "cpu", "data": {"batch_size": 2}},
+    )
+
+    assert cfg.virtual_workers == 8
+    assert cfg.epochs == 2
+    assert cfg.device == "cpu"
+    assert cfg.data.batch_size == 2
+    assert isinstance(cfg.trainer, SyncTrainerConfig)

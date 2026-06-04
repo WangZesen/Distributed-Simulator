@@ -812,12 +812,27 @@ def test_cli_cpu_smoke_single_process() -> None:
     assert "epochs=1" in result.stdout
 
 
-def test_cli_cpu_smoke_adaptive_mix() -> None:
+def test_cli_cpu_smoke_adaptive_mix(tmp_path) -> None:
+    config = tmp_path / "adaptive.toml"
+    config.write_text(
+        """
+[trainer]
+name = "decentralized"
+topology = "complete"
+
+[trainer.mix]
+name = "adaptive"
+start_epoch = 0
+min_gamma = 0.5
+max_gamma = 1.0
+""",
+    )
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "distributed_simulator.cli",
+            str(config),
             "--dataset",
             "synthetic",
             "--model",
@@ -832,14 +847,6 @@ def test_cli_cpu_smoke_adaptive_mix() -> None:
             "2",
             "--device",
             "cpu",
-            "--mix",
-            "adaptive",
-            "--adaptive-start-epoch",
-            "0",
-            "--adaptive-min-gamma",
-            "0.5",
-            "--adaptive-max-gamma",
-            "1.0",
         ],
         check=True,
         capture_output=True,
@@ -848,6 +855,43 @@ def test_cli_cpu_smoke_adaptive_mix() -> None:
     assert "decentralized workers=2 processes=1" in result.stdout
     assert "mix=adaptive" in result.stdout
     assert "accum_gamma=" in result.stdout
+
+
+def test_cli_sync_cpu_smoke_single_process(tmp_path) -> None:
+    config = tmp_path / "sync.toml"
+    config.write_text(
+        """
+[trainer]
+name = "sync"
+""",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "distributed_simulator.cli",
+            str(config),
+            "--dataset",
+            "synthetic",
+            "--model",
+            "linear",
+            "--workers",
+            "2",
+            "--epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--classes",
+            "2",
+            "--device",
+            "cpu",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "sync workers=2 processes=1" in result.stdout
+    assert "epochs=1" in result.stdout
 
 
 def test_cli_cpu_smoke_torchrun_two_processes() -> None:
@@ -881,4 +925,46 @@ def test_cli_cpu_smoke_torchrun_two_processes() -> None:
         timeout=60,
     )
     assert "decentralized workers=4 processes=2" in result.stdout
+    assert "epochs=1" in result.stdout
+
+
+def test_cli_sync_cpu_smoke_torchrun_two_processes(tmp_path) -> None:
+    config = tmp_path / "sync.toml"
+    config.write_text(
+        """
+[trainer]
+name = "sync"
+""",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            "-m",
+            "distributed_simulator.cli",
+            str(config),
+            "--dataset",
+            "synthetic",
+            "--model",
+            "linear",
+            "--workers",
+            "4",
+            "--epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--classes",
+            "2",
+            "--device",
+            "cpu",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert "sync workers=4 processes=2" in result.stdout
     assert "epochs=1" in result.stdout
