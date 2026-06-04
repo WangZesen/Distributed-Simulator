@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 dsim-train = "distributed_simulator.cli:main"
+dsim-eval-hessian-eigenvalues = "distributed_simulator.eval_hessian_eigenvalues:main"
 
 [build-system]
 requires = ["hatchling"]
