@@ -8,10 +8,11 @@ from loguru import logger
 from distributed_simulator.config import (
     ConstantSchedulerConfig,
     DataConfig,
-    DecentralizedConfig,
+    DecentralizedTrainerConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
+    SimulationConfig,
     Topology,
     WarmupCosineSchedulerConfig,
 )
@@ -85,7 +86,7 @@ def configure_logging(level: str) -> None:
     logger.add(sys.stderr, level=level.upper(), enqueue=True)
 
 
-def config_from_args(args: argparse.Namespace) -> DecentralizedConfig:
+def config_from_args(args: argparse.Namespace) -> SimulationConfig:
     data = DataConfig(
         dataset=DatasetName(args.dataset),
         root=args.data_root,
@@ -116,11 +117,13 @@ def config_from_args(args: argparse.Namespace) -> DecentralizedConfig:
         amp_dtype="bf16",
         compile=args.compile,
         compile_mode=args.compile_mode,
+    )
+    trainer = DecentralizedTrainerConfig(
+        topology=Topology(args.topology),
         overlap_mixing=not args.no_overlap_mixing,
     )
-    return DecentralizedConfig(
+    return SimulationConfig(
         virtual_workers=args.workers,
-        topology=Topology(args.topology),
         epochs=args.epochs,
         seed=args.seed,
         device=args.device,
@@ -129,6 +132,7 @@ def config_from_args(args: argparse.Namespace) -> DecentralizedConfig:
         scheduler=scheduler,
         data=data,
         runtime=runtime,
+        trainer=trainer,
     )
 
 
@@ -141,13 +145,16 @@ def main(argv: list[str] | None = None) -> None:
     ctx = init_process_context(device)
     try:
         run_cfg = cfg.model_copy(update={"device": str(device)})
+        trainer_cfg = run_cfg.trainer
+        if not isinstance(trainer_cfg, DecentralizedTrainerConfig):
+            raise ValueError("CLI currently supports only decentralized training")
         if ctx.rank == 0:
             logger.info(
                 "Launching decentralized simulation: "
                 "workers={} processes={} topology={} model={} dataset={} device={} epochs={}",
                 run_cfg.virtual_workers,
                 ctx.world_size,
-                run_cfg.topology.value,
+                trainer_cfg.topology.value,
                 run_cfg.model.name.value,
                 run_cfg.data.dataset.value,
                 run_cfg.device,
@@ -164,7 +171,8 @@ def main(argv: list[str] | None = None) -> None:
             print(
                 "decentralized "
                 f"workers={cfg.virtual_workers} processes={ctx.world_size} "
-                f"topology={cfg.topology.value} epochs={metrics.epochs} steps={metrics.steps} "
+                f"topology={trainer_cfg.topology.value} epochs={metrics.epochs} "
+                f"steps={metrics.steps} "
                 f"loss={metrics.loss:.6f} d2c={metrics.distance_to_consensus:.6f}"
             )
     finally:

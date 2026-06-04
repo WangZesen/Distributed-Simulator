@@ -8,6 +8,7 @@ import distributed_simulator.trainer as trainer_module
 from distributed_simulator.config import (
     DataConfig,
     DecentralizedConfig,
+    DecentralizedTrainerConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -23,7 +24,7 @@ from distributed_simulator.trainer import DecentralizedTrainer
 def test_standard_decentralized_cpu_smoke_single_process() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=4,
-        topology=Topology.RING,
+        trainer=DecentralizedTrainerConfig(topology=Topology.RING),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -48,7 +49,7 @@ def test_standard_decentralized_cpu_smoke_single_process() -> None:
 def test_synthetic_batches_are_image_shaped() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -64,7 +65,7 @@ def test_synthetic_batches_are_image_shaped() -> None:
 def test_decentralized_trainer_uses_packed_storage() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -117,7 +118,7 @@ def test_resolve_process_device_leaves_single_process_cuda_unindexed(monkeypatch
 def test_complete_mix_happens_before_optimizer_update() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -153,7 +154,7 @@ def test_complete_mix_happens_before_optimizer_update() -> None:
 def test_complete_topology_uses_complete_mix_path(monkeypatch) -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -171,7 +172,7 @@ def test_complete_topology_uses_complete_mix_path(monkeypatch) -> None:
 def test_sgd_update_uses_configured_momentum() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=0,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -256,7 +257,7 @@ def test_wide_resnet_cifar_trainer_smoke(monkeypatch) -> None:
     monkeypatch.setattr(trainer_module, "InMemoryCifar", FakeCifar)
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.WRN_16_1),
@@ -274,7 +275,7 @@ def test_wide_resnet_cifar_trainer_smoke(monkeypatch) -> None:
 def test_warmup_epochs_are_converted_to_update_steps() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=2,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -298,7 +299,7 @@ def test_warmup_epochs_are_converted_to_update_steps() -> None:
 def test_training_history_records_scheduled_evaluations() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=2,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -317,7 +318,7 @@ def test_training_history_records_scheduled_evaluations() -> None:
 def test_bf16_amp_packed_cpu_smoke() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=4,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -345,7 +346,7 @@ def test_torch_compile_forward_path_is_used(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", fake_compile)
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -401,7 +402,7 @@ def test_cuda_bf16_amp_wrn_smoke_uses_batched_autograd(monkeypatch) -> None:
     monkeypatch.setattr(trainer_module, "InMemoryCifar", FakeCifar)
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cuda",
         model=ModelConfig(name=ModelName.WRN_16_1),
@@ -425,7 +426,7 @@ def test_cuda_bf16_amp_wrn_smoke_uses_batched_autograd(monkeypatch) -> None:
 def test_evaluation_uses_global_averaged_model() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.RING,
+        trainer=DecentralizedTrainerConfig(topology=Topology.RING),
         epochs=0,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -454,7 +455,7 @@ def test_evaluation_uses_global_averaged_model() -> None:
 def test_evaluation_runs_every_five_epochs_and_final_epoch() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=7,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -472,7 +473,7 @@ def test_evaluation_runs_every_five_epochs_and_final_epoch() -> None:
 def test_evaluation_calibrates_batchnorm_before_testing(monkeypatch) -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=1,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),
@@ -500,7 +501,7 @@ def test_evaluation_calibrates_batchnorm_before_testing(monkeypatch) -> None:
 def test_eval_batch_size_is_capped_to_worker_shard_size() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
-        topology=Topology.COMPLETE,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=0,
         device="cpu",
         model=ModelConfig(name=ModelName.LINEAR),

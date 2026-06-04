@@ -2,7 +2,13 @@ import torch
 from torch import nn
 
 from distributed_simulator import data as data_module
-from distributed_simulator.config import DecentralizedConfig, WarmupCosineSchedulerConfig
+from distributed_simulator.config import (
+    DecentralizedConfig,
+    DecentralizedTrainerConfig,
+    SimulationConfig,
+    Topology,
+    WarmupCosineSchedulerConfig,
+)
 from distributed_simulator.data import (
     DatasetName,
     InMemoryCifar,
@@ -236,7 +242,7 @@ def test_batched_cifar_augmentation_matches_per_worker_path(monkeypatch) -> None
 
 
 def test_default_training_configuration_matches_requested_setup() -> None:
-    cfg = DecentralizedConfig()
+    cfg = SimulationConfig()
     assert cfg.model.name == ModelName.WRN_16_8
     assert cfg.data.dataset == DatasetName.CIFAR10
     assert cfg.virtual_workers == 8
@@ -252,3 +258,12 @@ def test_default_training_configuration_matches_requested_setup() -> None:
     assert cfg.runtime.compile_mode == "default"
     assert cfg.optimizer.momentum == 0.9
     assert cfg.optimizer.weight_decay == 5e-4
+    assert isinstance(cfg.trainer, DecentralizedTrainerConfig)
+    assert cfg.trainer.topology == Topology.RING
+    assert cfg.trainer.overlap_mixing is True
+
+
+def test_decentralized_config_accepts_legacy_flat_topology() -> None:
+    cfg = DecentralizedConfig.model_validate({"topology": Topology.COMPLETE})
+
+    assert cfg.topology == Topology.COMPLETE

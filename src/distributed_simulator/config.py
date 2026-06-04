@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -18,6 +18,12 @@ class Topology(StrEnum):
     RING = "ring"
     EXP = "exp"
     COMPLETE = "complete"
+
+
+class TrainerName(StrEnum):
+    DECENTRALIZED = "decentralized"
+    SYNC = "sync"
+    SAM = "sam"
 
 
 class OptimizerConfig(_ConfigModel):
@@ -63,12 +69,27 @@ class RuntimeConfig(_ConfigModel):
     amp_dtype: Literal["bf16"] = "bf16"
     compile: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
+
+
+class DecentralizedTrainerConfig(_ConfigModel):
+    name: Literal["decentralized"] = "decentralized"
+    topology: Topology = Topology.RING
     overlap_mixing: bool = True
 
 
-class DecentralizedConfig(_ConfigModel):
+class SyncTrainerConfig(_ConfigModel):
+    name: Literal["sync"] = "sync"
+
+
+class SAMTrainerConfig(_ConfigModel):
+    name: Literal["sam"] = "sam"
+
+
+TrainerConfig = DecentralizedTrainerConfig | SyncTrainerConfig | SAMTrainerConfig
+
+
+class SimulationConfig(_ConfigModel):
     virtual_workers: int = Field(default=8, gt=0)
-    topology: Topology = Topology.RING
     epochs: int = Field(default=200, ge=0)
     seed: int = Field(default=42, ge=0)
     device: str = "cpu"
@@ -77,6 +98,7 @@ class DecentralizedConfig(_ConfigModel):
     scheduler: SchedulerConfig = Field(default_factory=WarmupCosineSchedulerConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    trainer: TrainerConfig = Field(default_factory=DecentralizedTrainerConfig, discriminator="name")
 
     @field_validator("virtual_workers")
     @classmethod
@@ -85,12 +107,53 @@ class DecentralizedConfig(_ConfigModel):
         return value
 
     @model_validator(mode="after")
-    def validate_model_data_pair(self) -> DecentralizedConfig:
+    def validate_model_data_pair(self) -> SimulationConfig:
         if self.data.dataset != DatasetName.SYNTHETIC and self.model.name == ModelName.LINEAR:
             raise ValueError("CIFAR training requires a WideResNet model")
         if self.data.dataset == DatasetName.SYNTHETIC and self.model.name != ModelName.LINEAR:
             raise ValueError("WideResNet training requires CIFAR10 or CIFAR100 data")
         return self
+
+
+class DecentralizedConfig(SimulationConfig):
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_flat_decentralized_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if "topology" not in data and "overlap_mixing" not in data:
+            return data
+
+        migrated = dict(data)
+        trainer = migrated.get("trainer")
+        trainer_data = (
+            trainer.model_dump() if isinstance(trainer, _ConfigModel) else dict(trainer or {})
+        )
+        trainer_data.setdefault("name", "decentralized")
+        if "topology" in migrated:
+            trainer_data["topology"] = migrated.pop("topology")
+        if "overlap_mixing" in migrated:
+            trainer_data["overlap_mixing"] = migrated.pop("overlap_mixing")
+        migrated["trainer"] = trainer_data
+        return migrated
+
+    @model_validator(mode="after")
+    def validate_decentralized_trainer(self) -> DecentralizedConfig:
+        if not isinstance(self.trainer, DecentralizedTrainerConfig):
+            raise ValueError("DecentralizedConfig requires a decentralized trainer config")
+        return self
+
+    @property
+    def topology(self) -> Topology:
+        if not isinstance(self.trainer, DecentralizedTrainerConfig):
+            raise ValueError("DecentralizedConfig requires a decentralized trainer config")
+        return self.trainer.topology
+
+    @property
+    def overlap_mixing(self) -> bool:
+        if not isinstance(self.trainer, DecentralizedTrainerConfig):
+            raise ValueError("DecentralizedConfig requires a decentralized trainer config")
+        return self.trainer.overlap_mixing
 
 
 def _require_power_of_two(value: int, name: str) -> None:

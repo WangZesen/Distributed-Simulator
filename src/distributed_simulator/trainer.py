@@ -11,7 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 
-from distributed_simulator.config import DecentralizedConfig, Topology
+from distributed_simulator.config import (
+    DecentralizedTrainerConfig,
+    SimulationConfig,
+    Topology,
+)
 from distributed_simulator.data import (
     DatasetName,
     InMemoryCifar,
@@ -122,13 +126,17 @@ class DecentralizedTrainer:
     applies the optimizer update to the mixed parameters.
     """
 
-    def __init__(self, cfg: DecentralizedConfig, ctx: ProcessContext | None = None):
+    def __init__(self, cfg: SimulationConfig, ctx: ProcessContext | None = None):
         self.cfg = cfg
+        trainer_cfg = cfg.trainer
+        if not isinstance(trainer_cfg, DecentralizedTrainerConfig):
+            raise ValueError("DecentralizedTrainer requires a decentralized trainer config")
+        self.trainer_cfg = trainer_cfg
         self.device = torch.device(cfg.device)
         self.ctx = ctx or ProcessContext()
         self._validate_process_layout()
 
-        self.schedule = communication_schedule(cfg.topology, cfg.virtual_workers)
+        self.schedule = communication_schedule(self.trainer_cfg.topology, cfg.virtual_workers)
         self.owned_ranks = self._owned_ranks()
         self.workers_per_process = self.cfg.virtual_workers // self.ctx.world_size
         self.local_worker_count = len(self.owned_ranks)
@@ -158,7 +166,7 @@ class DecentralizedTrainer:
             self.cfg.runtime.amp_dtype,
             self.cfg.runtime.compile,
             self.cfg.runtime.compile_mode,
-            self.cfg.runtime.overlap_mixing,
+            self.trainer_cfg.overlap_mixing,
         )
         logger.debug(
             "Rank {} owns virtual workers {} on {}",
@@ -271,7 +279,7 @@ class DecentralizedTrainer:
         assert self.model is not None
         self.model.sync_storage_from_parameters_()
         vectors = self._local_vectors()
-        if self.cfg.topology == Topology.COMPLETE:
+        if self.trainer_cfg.topology == Topology.COMPLETE:
             return self._start_complete_graph_mix(vectors, stream=stream)
         return self._start_pairwise_topology_mix(vectors, step=step, stream=stream)
 
@@ -843,7 +851,7 @@ class DecentralizedTrainer:
 
     def _use_cuda_mixing_overlap(self) -> bool:
         return (
-            self.cfg.runtime.overlap_mixing
+            self.trainer_cfg.overlap_mixing
             and self.device.type == "cuda"
             and torch.cuda.is_available()
         )
