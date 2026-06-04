@@ -52,6 +52,7 @@ class InMemorySyntheticImages:
         self.images = images.to(device=device, dtype=torch.float32)
         self.labels = labels.to(device=device, dtype=torch.long)
         self.device = device
+        self._epoch_orders: dict[tuple[int, int], Tensor] = {}
         logger.info(
             "Loaded synthetic image data into {} memory: images={} labels={}",
             device,
@@ -85,6 +86,46 @@ class InMemorySyntheticImages:
             drop_last=True,
         )
         return self.images.index_select(0, indices), self.labels.index_select(0, indices)
+
+    def batch_for_workers(
+        self,
+        worker_ranks: Sequence[int],
+        virtual_workers: int,
+        batch_size: int,
+        epoch: int,
+        step: int,
+        seed: int,
+        augment: bool,
+    ) -> tuple[Tensor, Tensor]:
+        del augment
+        order = self.epoch_order(epoch=epoch, seed=seed)
+        indices = worker_indices_from_order_many(
+            order=order,
+            worker_ranks=worker_ranks,
+            virtual_workers=virtual_workers,
+            batch_size=batch_size,
+            step=step,
+            drop_last=True,
+        )
+        local_workers = len(worker_ranks)
+        images = self.images.index_select(0, indices.flatten())
+        labels = self.labels.index_select(0, indices.flatten())
+        images = images.view(local_workers, batch_size, *self.images.shape[1:])
+        labels = labels.view(local_workers, batch_size)
+        return images.transpose(0, 1).contiguous(), labels.transpose(0, 1).contiguous()
+
+    def epoch_order(self, epoch: int, seed: int) -> Tensor:
+        key = (epoch, seed)
+        order = self._epoch_orders.get(key)
+        if order is None:
+            order = deterministic_epoch_order(
+                dataset_size=len(self),
+                epoch=epoch,
+                seed=seed,
+                device=self.device,
+            )
+            self._epoch_orders[key] = order
+        return order
 
 
 class InMemoryCifar:
@@ -163,19 +204,13 @@ class InMemoryCifar:
         augment: bool,
     ) -> tuple[Tensor, Tensor]:
         order = self.epoch_order(epoch=epoch, seed=seed)
-        indices = torch.stack(
-            [
-                worker_indices_from_order(
-                    order=order,
-                    worker_rank=rank,
-                    virtual_workers=virtual_workers,
-                    batch_size=batch_size,
-                    step=step,
-                    drop_last=True,
-                )
-                for rank in worker_ranks
-            ],
-            dim=0,
+        indices = worker_indices_from_order_many(
+            order=order,
+            worker_ranks=worker_ranks,
+            virtual_workers=virtual_workers,
+            batch_size=batch_size,
+            step=step,
+            drop_last=True,
         )
         local_workers = len(worker_ranks)
         images = self.images.index_select(0, indices.flatten())
@@ -275,6 +310,47 @@ def worker_indices_from_order(
     if end <= worker_order.numel():
         return worker_order[offset:end]
     return torch.cat((worker_order[offset:], worker_order[: end % worker_order.numel()]))
+
+
+def worker_indices_from_order_many(
+    order: Tensor,
+    worker_ranks: Sequence[int],
+    virtual_workers: int,
+    batch_size: int,
+    step: int,
+    drop_last: bool,
+) -> Tensor:
+    if not worker_ranks:
+        raise ValueError("worker_ranks must not be empty")
+    if not drop_last:
+        return torch.stack(
+            [
+                worker_indices_from_order(
+                    order=order,
+                    worker_rank=rank,
+                    virtual_workers=virtual_workers,
+                    batch_size=batch_size,
+                    step=step,
+                    drop_last=drop_last,
+                )
+                for rank in worker_ranks
+            ],
+            dim=0,
+        )
+    if virtual_workers < 1 or virtual_workers & (virtual_workers - 1):
+        raise ValueError("virtual_workers must be a positive power of two")
+    if any(rank < 0 or rank >= virtual_workers for rank in worker_ranks):
+        raise ValueError(f"worker_ranks must be inside [0, {virtual_workers})")
+
+    ranks = torch.tensor(worker_ranks, device=order.device, dtype=torch.long)
+    shard_size = order.numel() // virtual_workers
+    usable = (shard_size // batch_size) * batch_size
+    if usable == 0:
+        raise ValueError("worker shard is empty; reduce virtual_workers or batch_size")
+
+    offsets = (step * batch_size + torch.arange(batch_size, device=order.device)) % usable
+    positions = ranks.unsqueeze(1) + offsets.unsqueeze(0) * virtual_workers
+    return order[positions]
 
 
 def deterministic_cifar_augment(

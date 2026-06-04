@@ -14,6 +14,7 @@ from distributed_simulator.config import (
 from distributed_simulator.data import (
     DatasetName,
     InMemoryCifar,
+    InMemorySyntheticImages,
     deterministic_cifar_augment,
     deterministic_epoch_order,
     deterministic_worker_indices,
@@ -238,6 +239,38 @@ def test_batched_cifar_augmentation_matches_per_worker_path(monkeypatch) -> None
             step=1,
             seed=9,
             augment=True,
+        )
+        assert torch.equal(multi_images[:, worker_rank], worker_images)
+        assert torch.equal(multi_labels[:, worker_rank], worker_labels)
+
+
+def test_batched_synthetic_data_matches_per_worker_path() -> None:
+    loader = InMemorySyntheticImages(
+        samples=64,
+        num_classes=3,
+        seed=123,
+        device=torch.device("cpu"),
+    )
+
+    multi_images, multi_labels = loader.batch_for_workers(
+        worker_ranks=(0, 1, 2, 3),
+        virtual_workers=4,
+        batch_size=4,
+        epoch=2,
+        step=1,
+        seed=9,
+        augment=False,
+    )
+
+    for worker_rank in range(4):
+        worker_images, worker_labels = loader.batch_for_worker(
+            worker_rank=worker_rank,
+            virtual_workers=4,
+            batch_size=4,
+            epoch=2,
+            step=1,
+            seed=9,
+            augment=False,
         )
         assert torch.equal(multi_images[:, worker_rank], worker_images)
         assert torch.equal(multi_labels[:, worker_rank], worker_labels)

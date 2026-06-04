@@ -214,6 +214,64 @@ def test_pairwise_adaptive_mix_does_not_mutate_before_lerp() -> None:
     assert torch.allclose(trainer._local_vectors(), expected)
 
 
+def test_ring_pairwise_peer_schedule_is_cached() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(topology=Topology.RING),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+
+    assert len(trainer.pairwise_exchange_plans) == 2
+    assert trainer._active_peer_by_rank(0) == {0: 1, 1: 0, 2: 3, 3: 2}
+    assert trainer._active_peer_by_rank(1) == {0: 3, 1: 2, 2: 1, 3: 0}
+    assert torch.equal(
+        trainer.pairwise_exchange_plans[0].peer_local_indices,
+        torch.tensor([1, 0, 3, 2]),
+    )
+
+
+def test_exp_pairwise_peer_schedule_is_cached() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=8,
+        trainer=DecentralizedTrainerConfig(topology=Topology.EXP),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+
+    assert len(trainer.pairwise_exchange_plans) == 3
+    assert trainer._active_peer_by_rank(0)[0] == 1
+    assert trainer._active_peer_by_rank(1)[0] == 2
+    assert trainer._active_peer_by_rank(2)[0] == 4
+
+
+def test_remote_pairwise_exchange_metadata_is_cached() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(topology=Topology.RING),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext(rank=0, world_size=2))
+
+    local_phase, remote_phase = trainer.pairwise_exchange_plans
+    assert local_phase.remote_processes == ()
+    assert remote_phase.remote_processes == (1,)
+    assert remote_phase.recv_by_process == {1: (2, 3)}
+    assert torch.equal(
+        remote_phase.send_local_indices_by_process[1],
+        torch.tensor([0, 1]),
+    )
+
+
 def test_adaptive_gamma_schedule_matches_reference() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,
@@ -307,6 +365,42 @@ def test_complete_topology_uses_complete_mix_path(monkeypatch) -> None:
 
     monkeypatch.setattr(trainer, "_start_pairwise_topology_mix", fail_pairwise_mix)
     trainer.train()
+
+
+def test_complete_mix_writes_directly_to_storage(monkeypatch) -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(
+            topology=Topology.COMPLETE,
+            mix=AdaptiveMixConfig(p=-1.0, min_gamma=0.25, max_gamma=1.0),
+        ),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    with torch.no_grad():
+        trainer._local_vectors()[0].fill_(0.0)
+        trainer._local_vectors()[1].fill_(2.0)
+        assert trainer.model is not None
+        trainer.model.sync_parameters_from_storage_()
+
+    def fail_load(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("complete mix should write directly to storage")
+
+    monkeypatch.setattr(trainer, "_load_local_vectors_", fail_load)
+
+    trainer._mix_parameters(step=0, gamma=0.25)
+
+    assert torch.allclose(
+        trainer._local_vectors()[0],
+        torch.full_like(trainer._local_vectors()[0], 0.25),
+    )
+    assert torch.allclose(
+        trainer._local_vectors()[1],
+        torch.full_like(trainer._local_vectors()[1], 1.75),
+    )
 
 
 def test_sgd_update_uses_configured_momentum() -> None:

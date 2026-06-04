@@ -67,10 +67,19 @@ class TrainMetrics:
 
 @dataclass
 class PendingPairwiseExchange:
-    recv_by_process: dict[int, list[int]]
+    recv_by_process: dict[int, tuple[int, ...]]
     recv_tensors: dict[int, torch.Tensor]
     works: list[dist.Work]
     send_tensors: list[torch.Tensor]
+
+
+@dataclass
+class PairwiseExchangePlan:
+    peer_by_rank: dict[int, int]
+    peer_local_indices: torch.Tensor
+    send_local_indices_by_process: dict[int, torch.Tensor]
+    recv_by_process: dict[int, tuple[int, ...]]
+    remote_processes: tuple[int, ...]
 
 
 @dataclass
@@ -82,6 +91,7 @@ class PendingMix:
     mixed: torch.Tensor | None = None
     all_reduce_work: dist.Work | None = None
     pairwise_peer_by_rank: dict[int, int] | None = None
+    pairwise_plan: PairwiseExchangePlan | None = None
     pairwise_exchange: PendingPairwiseExchange | None = None
 
 
@@ -124,6 +134,15 @@ class PackedModel(Protocol):
     def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self: ...
 
 
+def _peer_for_rank(rank: int, ranks: tuple[int, ...]) -> int:
+    if len(ranks) == 1:
+        return rank
+    if len(ranks) == 2:
+        first, second = ranks
+        return second if rank == first else first
+    raise ValueError("pairwise topology mix expected groups of size one or two")
+
+
 class DecentralizedTrainer:
     """Standard decentralized training over simulated virtual workers.
 
@@ -147,6 +166,11 @@ class DecentralizedTrainer:
         self.owned_ranks = self._owned_ranks()
         self.workers_per_process = self.cfg.virtual_workers // self.ctx.world_size
         self.local_worker_count = len(self.owned_ranks)
+        self.local_index_by_rank = {rank: i for i, rank in enumerate(self.owned_ranks)}
+        self.groups_by_rank = {
+            rank: groups_for_rank(self.schedule, rank) for rank in self.owned_ranks
+        }
+        self.pairwise_exchange_plans = self._build_pairwise_exchange_plans()
         self.dataset = self._init_data(train=True)
         self.test_dataset = self._init_data(train=False)
         self.training_step = 0
@@ -193,7 +217,9 @@ class DecentralizedTrainer:
             self.total_steps,
             self.local_worker_count,
         )
-        losses = []
+        total_loss_sum = torch.zeros((), device=self.device)
+        epoch_loss_sum = torch.zeros((), device=self.device)
+        completed_steps = 0
         history = []
         for step in range(self.total_steps):
             self.training_step = step
@@ -208,11 +234,14 @@ class DecentralizedTrainer:
                 self._mix_parameters(step, gamma=gamma)
             self._apply_optimizer_update(current_lr)
             self.accumulated_gamma += gamma
-            losses.append(loss.detach())
+            loss_value = loss.detach().float()
+            total_loss_sum.add_(loss_value)
+            epoch_loss_sum.add_(loss_value)
+            completed_steps += 1
             if (step + 1) % self.batches_per_epoch == 0:
                 epoch = (step + 1) // self.batches_per_epoch
-                epoch_losses = losses[-self.batches_per_epoch :]
-                train_loss = torch.stack(epoch_losses).mean().item()
+                train_loss = (epoch_loss_sum / self.batches_per_epoch).item()
+                epoch_loss_sum.zero_()
                 if self._should_evaluate_epoch(epoch):
                     metrics = self._evaluate_epoch(epoch, train_loss, current_lr, gamma)
                     history.append(metrics)
@@ -236,7 +265,7 @@ class DecentralizedTrainer:
             if history
             else self._evaluate_epoch(0, 0.0, 0.0, self._mixing_gamma(0, 0.0))
         )
-        local_loss = torch.stack(losses).mean().item() if losses else 0.0
+        local_loss = (total_loss_sum / completed_steps).item() if completed_steps else 0.0
         logger.info(
             "Rank {} finished decentralized training: loss={:.6f} d2c={:.6f}",
             self.ctx.rank,
@@ -316,23 +345,26 @@ class DecentralizedTrainer:
         if pending.stream is not None:
             torch.cuda.current_stream(self.device).wait_stream(pending.stream)
 
+        if self.trainer_cfg.topology == Topology.COMPLETE:
+            self._finish_complete_graph_mix_into_storage_(pending)
+            return
+
         mixed = self._finish_mixed_vectors(pending)
         self._load_local_vectors_(mixed)
 
     @torch.no_grad()
     def _finish_mixed_vectors(self, pending: PendingMix) -> torch.Tensor:
-        if pending.all_reduce_work is not None:
-            pending.all_reduce_work.wait()
-            mean = pending.vectors
-            mean.div_(self.ctx.world_size)
-            mixed = mean.expand(self.local_worker_count, -1).clone()
-            return self._apply_mix_gamma(pending.local_vectors, mixed, pending.gamma)
-        if pending.pairwise_exchange is not None and pending.pairwise_peer_by_rank is not None:
+        if (
+            pending.pairwise_exchange is not None
+            and pending.pairwise_peer_by_rank is not None
+            and pending.pairwise_plan is not None
+        ):
             remote_peer_vectors = self._finish_remote_peer_exchange(pending.pairwise_exchange)
             mixed = self._finish_pairwise_topology_mix(
                 pending.vectors,
                 pending.pairwise_peer_by_rank,
                 remote_peer_vectors,
+                peer_local_indices=pending.pairwise_plan.peer_local_indices,
             )
             return self._apply_mix_gamma(pending.local_vectors, mixed, pending.gamma)
         assert pending.mixed is not None
@@ -347,13 +379,11 @@ class DecentralizedTrainer:
     ) -> PendingMix:
         local_mean = local_vectors.mean(dim=0)
         if not self.ctx.is_distributed:
-            mixed = local_mean.expand_as(local_vectors).clone()
             return PendingMix(
                 stream=stream,
-                vectors=local_vectors,
+                vectors=local_mean,
                 local_vectors=local_vectors,
                 gamma=gamma,
-                mixed=mixed,
             )
 
         logger.debug("Rank {} mixing complete topology with one all-reduce", self.ctx.rank)
@@ -367,6 +397,20 @@ class DecentralizedTrainer:
         )
 
     @torch.no_grad()
+    def _finish_complete_graph_mix_into_storage_(self, pending: PendingMix) -> None:
+        assert self.model is not None
+        if pending.all_reduce_work is not None:
+            pending.all_reduce_work.wait()
+            pending.vectors.div_(self.ctx.world_size)
+
+        mean = pending.vectors.expand_as(pending.local_vectors)
+        if pending.gamma == 1.0:
+            pending.local_vectors.copy_(mean)
+        else:
+            pending.local_vectors.lerp_(mean, pending.gamma)
+        self.model.sync_parameters_from_storage_()
+
+    @torch.no_grad()
     def _start_pairwise_topology_mix(
         self,
         local_vectors: torch.Tensor,
@@ -374,10 +418,15 @@ class DecentralizedTrainer:
         gamma: float,
         stream: torch.cuda.Stream | None,
     ) -> PendingMix:
-        peer_by_rank = self._active_peer_by_rank(step)
-        exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
+        plan = self._pairwise_exchange_plan(step)
+        exchange = self._start_remote_peer_exchange(local_vectors, plan)
         if exchange is None:
-            mixed = self._finish_pairwise_topology_mix(local_vectors, peer_by_rank, {})
+            mixed = self._finish_pairwise_topology_mix(
+                local_vectors,
+                plan.peer_by_rank,
+                {},
+                peer_local_indices=plan.peer_local_indices,
+            )
             return PendingMix(
                 stream=stream,
                 vectors=local_vectors,
@@ -390,7 +439,8 @@ class DecentralizedTrainer:
             vectors=local_vectors,
             local_vectors=local_vectors,
             gamma=gamma,
-            pairwise_peer_by_rank=peer_by_rank,
+            pairwise_peer_by_rank=plan.peer_by_rank,
+            pairwise_plan=plan,
             pairwise_exchange=exchange,
         )
 
@@ -400,16 +450,20 @@ class DecentralizedTrainer:
         local_vectors: torch.Tensor,
         peer_by_rank: dict[int, int],
         remote_peer_vectors: dict[int, torch.Tensor],
+        peer_local_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        local_by_rank = {rank: i for i, rank in enumerate(self.owned_ranks)}
+        if peer_local_indices is not None and not remote_peer_vectors:
+            peer_vectors = local_vectors.index_select(0, peer_local_indices)
+            return torch.add(local_vectors, peer_vectors).mul_(0.5)
+
         peer_vectors = torch.empty_like(local_vectors)
 
         for local_index, rank in enumerate(self.owned_ranks):
             peer = peer_by_rank[rank]
             if peer == rank:
                 peer_vectors[local_index].copy_(local_vectors[local_index])
-            elif peer in local_by_rank:
-                peer_vectors[local_index].copy_(local_vectors[local_by_rank[peer]])
+            elif peer in self.local_index_by_rank:
+                peer_vectors[local_index].copy_(local_vectors[self.local_index_by_rank[peer]])
             else:
                 peer_vectors[local_index].copy_(remote_peer_vectors[peer])
         return torch.add(local_vectors, peer_vectors).mul_(0.5)
@@ -453,33 +507,19 @@ class DecentralizedTrainer:
     def _start_remote_peer_exchange(
         self,
         local_vectors: torch.Tensor,
-        peer_by_rank: dict[int, int],
+        plan: PairwiseExchangePlan,
     ) -> PendingPairwiseExchange | None:
-        if not self.ctx.is_distributed:
+        if not self.ctx.is_distributed or not plan.remote_processes:
             return None
-
-        local_by_rank = {rank: i for i, rank in enumerate(self.owned_ranks)}
-        send_by_process: dict[int, list[int]] = {}
-        recv_by_process: dict[int, list[int]] = {}
-        for rank in self.owned_ranks:
-            peer = peer_by_rank[rank]
-            peer_process = self._process_for_worker(peer)
-            if peer_process != self.ctx.rank:
-                recv_by_process.setdefault(peer_process, []).append(peer)
-
-            if peer_process != self.ctx.rank:
-                send_by_process.setdefault(peer_process, []).append(rank)
 
         ops: list[dist.P2POp] = []
         recv_tensors: dict[int, torch.Tensor] = {}
         send_tensors: list[torch.Tensor] = []
-        for process in sorted(set(send_by_process) | set(recv_by_process)):
-            send_ranks = sorted(send_by_process.get(process, []))
-            recv_ranks = sorted(recv_by_process.get(process, []))
-            if send_ranks:
-                send_tensor = torch.stack(
-                    [local_vectors[local_by_rank[rank]] for rank in send_ranks]
-                ).contiguous()
+        for process in plan.remote_processes:
+            send_indices = plan.send_local_indices_by_process.get(process)
+            recv_ranks = plan.recv_by_process.get(process, ())
+            if send_indices is not None:
+                send_tensor = local_vectors.index_select(0, send_indices)
                 send_tensors.append(send_tensor)
                 ops.append(dist.P2POp(dist.isend, send_tensor, process))
             if recv_ranks:
@@ -496,11 +536,11 @@ class DecentralizedTrainer:
             logger.debug(
                 "Rank {} exchanging pairwise parameters with {} remote process(es)",
                 self.ctx.rank,
-                len(set(send_by_process) | set(recv_by_process)),
+                len(plan.remote_processes),
             )
             works = list(dist.batch_isend_irecv(ops))
             return PendingPairwiseExchange(
-                recv_by_process=recv_by_process,
+                recv_by_process=plan.recv_by_process,
                 recv_tensors=recv_tensors,
                 works=works,
                 send_tensors=send_tensors,
@@ -602,18 +642,68 @@ class DecentralizedTrainer:
         return buffers
 
     def _active_peer_by_rank(self, step: int) -> dict[int, int]:
-        peer_by_rank = {}
-        for rank in self.owned_ranks:
-            local_groups = groups_for_rank(self.schedule, rank)
-            active = local_groups[step % len(local_groups)]
-            if len(active.ranks) == 1:
-                peer_by_rank[rank] = rank
-            elif len(active.ranks) == 2:
-                first, second = active.ranks
-                peer_by_rank[rank] = second if rank == first else first
-            else:
-                raise ValueError("pairwise topology mix expected groups of size one or two")
-        return peer_by_rank
+        if not self.pairwise_exchange_plans:
+            return {rank: rank for rank in self.owned_ranks}
+        return dict(self._pairwise_exchange_plan(step).peer_by_rank)
+
+    def _pairwise_exchange_plan(self, step: int) -> PairwiseExchangePlan:
+        if not self.pairwise_exchange_plans:
+            raise ValueError("pairwise exchange plan requested for complete topology")
+        return self.pairwise_exchange_plans[step % len(self.pairwise_exchange_plans)]
+
+    def _build_pairwise_exchange_plans(self) -> tuple[PairwiseExchangePlan, ...]:
+        if self.trainer_cfg.topology == Topology.COMPLETE:
+            return ()
+        if not self.owned_ranks:
+            return ()
+
+        phase_count = max(len(groups) for groups in self.groups_by_rank.values())
+        plans = []
+        for phase in range(phase_count):
+            peer_by_rank: dict[int, int] = {}
+            peer_local_indices = []
+            send_by_process: dict[int, list[tuple[int, int]]] = {}
+            recv_by_process: dict[int, list[int]] = {}
+
+            for local_index, rank in enumerate(self.owned_ranks):
+                local_groups = self.groups_by_rank[rank]
+                active = local_groups[phase % len(local_groups)]
+                peer = _peer_for_rank(rank, active.ranks)
+                peer_by_rank[rank] = peer
+                peer_local_index = self.local_index_by_rank.get(peer, -1)
+                peer_local_indices.append(peer_local_index)
+
+                peer_process = self._process_for_worker(peer)
+                if peer_process != self.ctx.rank:
+                    send_by_process.setdefault(peer_process, []).append((rank, local_index))
+                    recv_by_process.setdefault(peer_process, []).append(peer)
+
+            send_indices = {
+                process: torch.tensor(
+                    [local_index for _, local_index in sorted(items)],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                for process, items in send_by_process.items()
+            }
+            recv_ranks = {
+                process: tuple(sorted(ranks)) for process, ranks in recv_by_process.items()
+            }
+            remote_processes = tuple(sorted(set(send_indices) | set(recv_ranks)))
+            plans.append(
+                PairwiseExchangePlan(
+                    peer_by_rank=peer_by_rank,
+                    peer_local_indices=torch.tensor(
+                        peer_local_indices,
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                    send_local_indices_by_process=send_indices,
+                    recv_by_process=recv_ranks,
+                    remote_processes=remote_processes,
+                )
+            )
+        return tuple(plans)
 
     def _batches_per_epoch(self) -> int:
         shard_size = len(self.dataset) // self.cfg.virtual_workers
@@ -667,7 +757,7 @@ class DecentralizedTrainer:
         batch_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = batch_size or self.cfg.data.batch_size
-        if isinstance(dataset, InMemoryCifar) and hasattr(dataset, "batch_for_workers"):
+        if hasattr(dataset, "batch_for_workers"):
             return dataset.batch_for_workers(
                 worker_ranks=self.owned_ranks,
                 virtual_workers=self.cfg.virtual_workers,
