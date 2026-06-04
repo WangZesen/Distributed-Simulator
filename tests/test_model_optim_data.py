@@ -292,7 +292,7 @@ def test_default_training_configuration_matches_requested_setup() -> None:
     assert cfg.data.eval_batch_size == 10000
     assert cfg.runtime.amp is True
     assert cfg.runtime.amp_dtype == "bf16"
-    assert cfg.runtime.compile is False
+    assert cfg.runtime.compile is True
     assert cfg.runtime.compile_mode == "default"
     assert cfg.optimizer.momentum == 0.9
     assert cfg.optimizer.weight_decay == 5e-4
