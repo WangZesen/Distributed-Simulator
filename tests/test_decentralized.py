@@ -786,9 +786,12 @@ def test_eval_batch_size_is_capped_to_worker_shard_size() -> None:
 def test_cli_cpu_smoke_single_process(tmp_path) -> None:
     config = tmp_path / "runtime.toml"
     config.write_text(
-        """
+        f"""
 [runtime]
 compile = false
+
+[logging]
+root = "{tmp_path / "logs"}"
 """,
     )
     result = subprocess.run(
@@ -818,14 +821,23 @@ compile = false
     )
     assert "decentralized workers=2 processes=1" in result.stdout
     assert "epochs=1" in result.stdout
+    assert "log_dir=" in result.stdout
+    run_dirs = list((tmp_path / "logs").iterdir())
+    assert len(run_dirs) == 1
+    assert (run_dirs[0] / "config.toml").exists()
+    assert (run_dirs[0] / "train.log").exists()
+    assert (run_dirs[0] / "stats.csv").exists()
 
 
 def test_cli_cpu_smoke_adaptive_mix(tmp_path) -> None:
     config = tmp_path / "adaptive.toml"
     config.write_text(
-        """
+        f"""
 [runtime]
 compile = false
+
+[logging]
+root = "{tmp_path / "logs"}"
 
 [trainer]
 name = "decentralized"
@@ -871,9 +883,12 @@ max_gamma = 1.0
 def test_cli_sync_cpu_smoke_single_process(tmp_path) -> None:
     config = tmp_path / "sync.toml"
     config.write_text(
-        """
+        f"""
 [runtime]
 compile = false
+
+[logging]
+root = "{tmp_path / "logs"}"
 
 [trainer]
 name = "sync"
@@ -911,9 +926,12 @@ name = "sync"
 def test_cli_cpu_smoke_torchrun_two_processes(tmp_path) -> None:
     config = tmp_path / "runtime.toml"
     config.write_text(
-        """
+        f"""
 [runtime]
 compile = false
+
+[logging]
+root = "{tmp_path / "logs"}"
 """,
     )
     result = subprocess.run(
@@ -953,9 +971,12 @@ compile = false
 def test_cli_sync_cpu_smoke_torchrun_two_processes(tmp_path) -> None:
     config = tmp_path / "sync.toml"
     config.write_text(
-        """
+        f"""
 [runtime]
 compile = false
+
+[logging]
+root = "{tmp_path / "logs"}"
 
 [trainer]
 name = "sync"

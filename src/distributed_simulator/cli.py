@@ -7,6 +7,12 @@ from typing import Any
 
 from loguru import logger
 
+from distributed_simulator.artifacts import (
+    create_run_dir,
+    save_last_checkpoints,
+    save_resolved_config,
+    save_stats_csv,
+)
 from distributed_simulator.config import (
     DecentralizedTrainerConfig,
     SAMTrainerConfig,
@@ -115,7 +121,12 @@ def main(argv: list[str] | None = None) -> None:
     try:
         run_cfg = cfg.model_copy(update={"device": str(device)})
         trainer_cfg = run_cfg.trainer
+        run_dir: Path | None = None
         if ctx.rank == 0:
+            run_dir = create_run_dir(run_cfg)
+            logger.add(run_dir / "train.log", level=args.log_level.upper(), enqueue=True)
+            save_resolved_config(run_cfg, run_dir / "config.toml")
+            logger.info("Writing run artifacts to {}", run_dir)
             logger.info(
                 "Launching {} simulation: "
                 "workers={} processes={} model={} dataset={} "
@@ -130,7 +141,14 @@ def main(argv: list[str] | None = None) -> None:
             )
         trainer = build_trainer(run_cfg, ctx)
         metrics = trainer.train()
+        if run_cfg.logging.save_last_checkpoint:
+            checkpoint_dir = (
+                run_dir / "checkpoints" if run_dir is not None else run_cfg.logging.root
+            )
+            save_last_checkpoints(trainer, checkpoint_dir)
         if ctx.rank == 0:
+            assert run_dir is not None
+            save_stats_csv(metrics, run_dir / "stats.csv")
             logger.info(
                 "Finished {} simulation: loss={:.6f} d2c={:.6f}",
                 trainer_cfg.name,
@@ -145,7 +163,8 @@ def main(argv: list[str] | None = None) -> None:
                 f"epochs={metrics.epochs} "
                 f"steps={metrics.steps} "
                 f"loss={metrics.loss:.6f} d2c={metrics.distance_to_consensus:.6f} "
-                f"gamma={metrics.gamma:.6f} accum_gamma={metrics.accumulated_gamma:.6f}"
+                f"gamma={metrics.gamma:.6f} accum_gamma={metrics.accumulated_gamma:.6f} "
+                f"log_dir={run_dir}"
             )
     finally:
         destroy_process_context()

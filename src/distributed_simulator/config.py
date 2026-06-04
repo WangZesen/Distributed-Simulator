@@ -72,6 +72,11 @@ class RuntimeConfig(_ConfigModel):
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
 
 
+class LoggingConfig(_ConfigModel):
+    root: Path = Path("logs")
+    save_last_checkpoint: bool = False
+
+
 class NormalMixConfig(_ConfigModel):
     name: Literal["normal"] = "normal"
 
@@ -125,6 +130,7 @@ class SimulationConfig(_ConfigModel):
     scheduler: SchedulerConfig = Field(default_factory=WarmupCosineSchedulerConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
     trainer: TrainerConfig = Field(default_factory=DecentralizedTrainerConfig, discriminator="name")
 
     @field_validator("virtual_workers")

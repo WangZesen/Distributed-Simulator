@@ -145,9 +145,12 @@ def test_sam_gradient_averaging_uses_one_coalesced_all_reduce(monkeypatch) -> No
 def test_cli_sam_cpu_smoke_single_process(tmp_path) -> None:
     config = tmp_path / "sam.toml"
     config.write_text(
-        """
+        f"""
 [runtime]
 compile = false
+
+[logging]
+root = "{tmp_path / "logs"}"
 
 [trainer]
 name = "sam"
