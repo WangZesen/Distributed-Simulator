@@ -6,10 +6,12 @@ import torch
 
 import distributed_simulator.trainer as trainer_module
 from distributed_simulator.config import (
+    AdaptiveMixConfig,
     DataConfig,
     DecentralizedConfig,
     DecentralizedTrainerConfig,
     ModelConfig,
+    NormalMixConfig,
     OptimizerConfig,
     RuntimeConfig,
     Topology,
@@ -149,6 +151,144 @@ def test_complete_mix_happens_before_optimizer_update() -> None:
         actual._packed_storage_value("weight")[0],
         actual._packed_storage_value("weight")[1],
     )
+
+
+def test_complete_mix_supports_partial_adaptive_gamma() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(
+            topology=Topology.COMPLETE,
+            mix=AdaptiveMixConfig(p=-1.0, min_gamma=0.25, max_gamma=1.0),
+        ),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    with torch.no_grad():
+        trainer._local_vectors()[0].fill_(0.0)
+        trainer._local_vectors()[1].fill_(2.0)
+        assert trainer.model is not None
+        trainer.model.sync_parameters_from_storage_()
+
+    trainer._mix_parameters(step=0, gamma=0.25)
+
+    assert torch.allclose(
+        trainer._local_vectors()[0],
+        torch.full_like(trainer._local_vectors()[0], 0.25),
+    )
+    assert torch.allclose(
+        trainer._local_vectors()[1],
+        torch.full_like(trainer._local_vectors()[1], 1.75),
+    )
+
+
+def test_pairwise_adaptive_mix_does_not_mutate_before_lerp() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(
+            topology=Topology.RING,
+            mix=AdaptiveMixConfig(p=-1.0, min_gamma=0.5, max_gamma=1.0),
+        ),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    original = torch.arange(4, dtype=trainer._local_vectors().dtype).unsqueeze(1)
+    original = original.expand_as(trainer._local_vectors()).clone()
+    with torch.no_grad():
+        trainer._local_vectors().copy_(original)
+        assert trainer.model is not None
+        trainer.model.sync_parameters_from_storage_()
+
+    trainer._mix_parameters(step=0, gamma=0.5)
+
+    expected = original.clone()
+    expected[0].fill_(0.25)
+    expected[1].fill_(0.75)
+    expected[2].fill_(2.25)
+    expected[3].fill_(2.75)
+    assert torch.allclose(trainer._local_vectors(), expected)
+
+
+def test_adaptive_gamma_schedule_matches_reference() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(
+            topology=Topology.COMPLETE,
+            mix=AdaptiveMixConfig(p=2.0, min_gamma=0.1, max_gamma=0.9, start_epoch=1),
+        ),
+        epochs=3,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        optimizer=OptimizerConfig(lr=0.2),
+        scheduler=WarmupCosineSchedulerConfig(
+            warmup_epochs=0,
+            warmup_start_factor=1.0,
+            eta_min_factor=0.0,
+        ),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    start_step = trainer.batches_per_epoch
+    start_lr = trainer._learning_rate(start_step)
+    later_step = start_step + 1
+    later_lr = trainer._learning_rate(later_step)
+
+    assert trainer._mixing_gamma(0, trainer._learning_rate(0)) == pytest.approx(0.9)
+    assert trainer._mixing_gamma(start_step, start_lr) == pytest.approx(0.9)
+    expected = ((later_lr / start_lr) ** 2.0) * 0.8 + 0.1
+    assert trainer._mixing_gamma(later_step, later_lr) == pytest.approx(expected)
+
+
+def test_adaptive_negative_p_uses_min_gamma() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(
+            topology=Topology.COMPLETE,
+            mix=AdaptiveMixConfig(p=-1.0, min_gamma=0.2, max_gamma=0.9, start_epoch=1),
+        ),
+        epochs=1,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+
+    assert trainer._mixing_gamma(0, trainer._learning_rate(0)) == pytest.approx(0.2)
+
+
+def test_adaptive_gamma_one_matches_standard_decentralized() -> None:
+    normal_cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(
+            topology=Topology.COMPLETE,
+            mix=NormalMixConfig(),
+        ),
+        epochs=1,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    adaptive_cfg = normal_cfg.model_copy(
+        update={
+            "trainer": DecentralizedTrainerConfig(
+                topology=Topology.COMPLETE,
+                mix=AdaptiveMixConfig(p=-1.0, min_gamma=1.0, max_gamma=1.0),
+            )
+        }
+    )
+    normal = DecentralizedTrainer(normal_cfg, ProcessContext())
+    adaptive = DecentralizedTrainer(adaptive_cfg, ProcessContext())
+
+    normal_metrics = normal.train()
+    adaptive_metrics = adaptive.train()
+
+    assert torch.allclose(normal._local_vectors(), adaptive._local_vectors())
+    assert normal_metrics.loss == pytest.approx(adaptive_metrics.loss)
 
 
 def test_complete_topology_uses_complete_mix_path(monkeypatch) -> None:
@@ -545,6 +685,44 @@ def test_cli_cpu_smoke_single_process() -> None:
     )
     assert "decentralized workers=2 processes=1" in result.stdout
     assert "epochs=1" in result.stdout
+
+
+def test_cli_cpu_smoke_adaptive_mix() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "distributed_simulator.cli",
+            "--dataset",
+            "synthetic",
+            "--model",
+            "linear",
+            "--workers",
+            "2",
+            "--epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--classes",
+            "2",
+            "--device",
+            "cpu",
+            "--mix",
+            "adaptive",
+            "--adaptive-start-epoch",
+            "0",
+            "--adaptive-min-gamma",
+            "0.5",
+            "--adaptive-max-gamma",
+            "1.0",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "decentralized workers=2 processes=1" in result.stdout
+    assert "mix=adaptive" in result.stdout
+    assert "accum_gamma=" in result.stdout
 
 
 def test_cli_cpu_smoke_torchrun_two_processes() -> None:

@@ -71,10 +71,35 @@ class RuntimeConfig(_ConfigModel):
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
 
 
+class NormalMixConfig(_ConfigModel):
+    name: Literal["normal"] = "normal"
+
+
+class AdaptiveMixConfig(_ConfigModel):
+    name: Literal["adaptive"] = "adaptive"
+    p: float = 3.0
+    max_gamma: float = Field(default=1.0, ge=0.0)
+    min_gamma: float = Field(default=0.0, ge=0.0)
+    start_epoch: int = Field(default=10, ge=0)
+
+    @model_validator(mode="after")
+    def validate_gamma_range(self) -> AdaptiveMixConfig:
+        if self.min_gamma > self.max_gamma:
+            raise ValueError("min_gamma must be less than or equal to max_gamma")
+        return self
+
+
+MixConfig = Annotated[
+    NormalMixConfig | AdaptiveMixConfig,
+    Field(discriminator="name"),
+]
+
+
 class DecentralizedTrainerConfig(_ConfigModel):
     name: Literal["decentralized"] = "decentralized"
     topology: Topology = Topology.RING
     overlap_mixing: bool = True
+    mix: MixConfig = Field(default_factory=NormalMixConfig)
 
 
 class SyncTrainerConfig(_ConfigModel):

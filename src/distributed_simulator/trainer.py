@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from distributed_simulator.config import (
+    AdaptiveMixConfig,
     DecentralizedTrainerConfig,
     SimulationConfig,
     Topology,
@@ -43,6 +44,8 @@ class EpochMetrics:
     test_accuracy: float
     distance_to_consensus: float
     lr: float
+    gamma: float
+    accumulated_gamma: float
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,8 @@ class TrainMetrics:
     test_loss: float
     test_accuracy: float
     lr: float
+    gamma: float
+    accumulated_gamma: float
     epochs: int
     steps: int
     rank: int
@@ -72,6 +77,8 @@ class PendingPairwiseExchange:
 class PendingMix:
     stream: torch.cuda.Stream | None
     vectors: torch.Tensor
+    local_vectors: torch.Tensor
+    gamma: float
     mixed: torch.Tensor | None = None
     all_reduce_work: dist.Work | None = None
     pairwise_peer_by_rank: dict[int, int] | None = None
@@ -157,6 +164,8 @@ class DecentralizedTrainer:
         self.active_no_decay_parameters: list[torch.Tensor] = []
         self.active_no_decay_gradients: list[torch.Tensor] = []
         self.momentum_buffers: dict[int, torch.Tensor] = {}
+        self.accumulated_gamma = 0.0
+        self._adaptive_max_lr: float | None = None
         self._init_packed_model()
         logger.info(
             "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} "
@@ -188,36 +197,45 @@ class DecentralizedTrainer:
         history = []
         for step in range(self.total_steps):
             self.training_step = step
+            current_lr = self._learning_rate(step)
+            gamma = self._mixing_gamma(step, current_lr)
             if self._use_cuda_mixing_overlap():
-                pending_mix = self._start_mixing(step)
+                pending_mix = self._start_mixing(step, gamma=gamma)
                 loss = self._compute_local_gradients()
                 self._finish_mixing(pending_mix)
             else:
                 loss = self._compute_local_gradients()
-                self._mix_parameters(step)
-            current_lr = self._learning_rate(step)
+                self._mix_parameters(step, gamma=gamma)
             self._apply_optimizer_update(current_lr)
+            self.accumulated_gamma += gamma
             losses.append(loss.detach())
             if (step + 1) % self.batches_per_epoch == 0:
                 epoch = (step + 1) // self.batches_per_epoch
                 epoch_losses = losses[-self.batches_per_epoch :]
                 train_loss = torch.stack(epoch_losses).mean().item()
                 if self._should_evaluate_epoch(epoch):
-                    metrics = self._evaluate_epoch(epoch, train_loss, current_lr)
+                    metrics = self._evaluate_epoch(epoch, train_loss, current_lr, gamma)
                     history.append(metrics)
                     if self.ctx.rank == 0:
                         logger.info(
                             "epoch={} train_loss={:.6f} test_loss={:.6f} "
-                            "test_acc={:.4f} d2c={:.6f} lr={:.6g}",
+                            "test_acc={:.4f} d2c={:.6f} lr={:.6g} "
+                            "gamma={:.6g} accum_gamma={:.6g}",
                             metrics.epoch,
                             metrics.train_loss,
                             metrics.test_loss,
                             metrics.test_accuracy,
                             metrics.distance_to_consensus,
                             metrics.lr,
+                            metrics.gamma,
+                            metrics.accumulated_gamma,
                         )
 
-        final_metrics = history[-1] if history else self._evaluate_epoch(0, 0.0, 0.0)
+        final_metrics = (
+            history[-1]
+            if history
+            else self._evaluate_epoch(0, 0.0, 0.0, self._mixing_gamma(0, 0.0))
+        )
         local_loss = torch.stack(losses).mean().item() if losses else 0.0
         logger.info(
             "Rank {} finished decentralized training: loss={:.6f} d2c={:.6f}",
@@ -231,6 +249,8 @@ class DecentralizedTrainer:
             test_loss=final_metrics.test_loss,
             test_accuracy=final_metrics.test_accuracy,
             lr=final_metrics.lr,
+            gamma=final_metrics.gamma,
+            accumulated_gamma=final_metrics.accumulated_gamma,
             epochs=self.cfg.epochs,
             steps=self.total_steps,
             rank=self.ctx.rank,
@@ -255,33 +275,41 @@ class DecentralizedTrainer:
         return loss.detach().float()
 
     @torch.no_grad()
-    def _mix_parameters(self, step: int) -> None:
-        self._finish_mixing(self._start_mixing(step, overlap=False))
+    def _mix_parameters(self, step: int, gamma: float | None = None) -> None:
+        gamma = self._mixing_gamma(step, self._learning_rate(step)) if gamma is None else gamma
+        self._finish_mixing(self._start_mixing(step, gamma=gamma, overlap=False))
 
     @torch.no_grad()
-    def _start_mixing(self, step: int, overlap: bool | None = None) -> PendingMix:
+    def _start_mixing(
+        self,
+        step: int,
+        gamma: float | None = None,
+        overlap: bool | None = None,
+    ) -> PendingMix:
         assert self.model is not None
+        gamma = self._mixing_gamma(step, self._learning_rate(step)) if gamma is None else gamma
         use_overlap = self._use_cuda_mixing_overlap() if overlap is None else overlap
         if not use_overlap:
-            return self._start_mixing_on_current_stream(step, stream=None)
+            return self._start_mixing_on_current_stream(step, gamma=gamma, stream=None)
 
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
-            return self._start_mixing_on_current_stream(step, stream=stream)
+            return self._start_mixing_on_current_stream(step, gamma=gamma, stream=stream)
 
     @torch.no_grad()
     def _start_mixing_on_current_stream(
         self,
         step: int,
+        gamma: float,
         stream: torch.cuda.Stream | None,
     ) -> PendingMix:
         assert self.model is not None
         self.model.sync_storage_from_parameters_()
         vectors = self._local_vectors()
         if self.trainer_cfg.topology == Topology.COMPLETE:
-            return self._start_complete_graph_mix(vectors, stream=stream)
-        return self._start_pairwise_topology_mix(vectors, step=step, stream=stream)
+            return self._start_complete_graph_mix(vectors, gamma=gamma, stream=stream)
+        return self._start_pairwise_topology_mix(vectors, step=step, gamma=gamma, stream=stream)
 
     @torch.no_grad()
     def _finish_mixing(self, pending: PendingMix) -> None:
@@ -297,47 +325,71 @@ class DecentralizedTrainer:
             pending.all_reduce_work.wait()
             mean = pending.vectors
             mean.div_(self.ctx.world_size)
-            return mean.expand(self.local_worker_count, -1).clone()
+            mixed = mean.expand(self.local_worker_count, -1).clone()
+            return self._apply_mix_gamma(pending.local_vectors, mixed, pending.gamma)
         if pending.pairwise_exchange is not None and pending.pairwise_peer_by_rank is not None:
             remote_peer_vectors = self._finish_remote_peer_exchange(pending.pairwise_exchange)
-            return self._finish_pairwise_topology_mix(
+            mixed = self._finish_pairwise_topology_mix(
                 pending.vectors,
                 pending.pairwise_peer_by_rank,
                 remote_peer_vectors,
             )
+            return self._apply_mix_gamma(pending.local_vectors, mixed, pending.gamma)
         assert pending.mixed is not None
-        return pending.mixed
+        return self._apply_mix_gamma(pending.local_vectors, pending.mixed, pending.gamma)
 
     @torch.no_grad()
     def _start_complete_graph_mix(
         self,
         local_vectors: torch.Tensor,
+        gamma: float,
         stream: torch.cuda.Stream | None,
     ) -> PendingMix:
         local_mean = local_vectors.mean(dim=0)
         if not self.ctx.is_distributed:
             mixed = local_mean.expand_as(local_vectors).clone()
-            return PendingMix(stream=stream, vectors=local_vectors, mixed=mixed)
+            return PendingMix(
+                stream=stream,
+                vectors=local_vectors,
+                local_vectors=local_vectors,
+                gamma=gamma,
+                mixed=mixed,
+            )
 
         logger.debug("Rank {} mixing complete topology with one all-reduce", self.ctx.rank)
         work = dist.all_reduce(local_mean, op=dist.ReduceOp.SUM, async_op=True)
-        return PendingMix(stream=stream, vectors=local_mean, all_reduce_work=work)
+        return PendingMix(
+            stream=stream,
+            vectors=local_mean,
+            local_vectors=local_vectors,
+            gamma=gamma,
+            all_reduce_work=work,
+        )
 
     @torch.no_grad()
     def _start_pairwise_topology_mix(
         self,
         local_vectors: torch.Tensor,
         step: int,
+        gamma: float,
         stream: torch.cuda.Stream | None,
     ) -> PendingMix:
         peer_by_rank = self._active_peer_by_rank(step)
         exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
         if exchange is None:
             mixed = self._finish_pairwise_topology_mix(local_vectors, peer_by_rank, {})
-            return PendingMix(stream=stream, vectors=local_vectors, mixed=mixed)
+            return PendingMix(
+                stream=stream,
+                vectors=local_vectors,
+                local_vectors=local_vectors,
+                gamma=gamma,
+                mixed=mixed,
+            )
         return PendingMix(
             stream=stream,
             vectors=local_vectors,
+            local_vectors=local_vectors,
+            gamma=gamma,
             pairwise_peer_by_rank=peer_by_rank,
             pairwise_exchange=exchange,
         )
@@ -360,7 +412,42 @@ class DecentralizedTrainer:
                 peer_vectors[local_index].copy_(local_vectors[local_by_rank[peer]])
             else:
                 peer_vectors[local_index].copy_(remote_peer_vectors[peer])
-        return local_vectors.add(peer_vectors).mul_(0.5)
+        return torch.add(local_vectors, peer_vectors).mul_(0.5)
+
+    def _mixing_gamma(self, step: int, lr: float) -> float:
+        mix_cfg = self.trainer_cfg.mix
+        if mix_cfg.name == "normal":
+            return 1.0
+
+        if not isinstance(mix_cfg, AdaptiveMixConfig):
+            raise ValueError(f"unsupported decentralized mix config: {mix_cfg.name}")
+
+        if mix_cfg.p < 0:
+            return mix_cfg.min_gamma
+
+        epoch = step // self.batches_per_epoch if self.batches_per_epoch else 0
+        if epoch < mix_cfg.start_epoch:
+            return mix_cfg.max_gamma
+
+        if self._adaptive_max_lr is None:
+            self._adaptive_max_lr = lr
+
+        if self._adaptive_max_lr <= 0.0:
+            lr_ratio = 0.0
+        else:
+            lr_ratio = lr / self._adaptive_max_lr
+        gamma = (lr_ratio**mix_cfg.p) * (mix_cfg.max_gamma - mix_cfg.min_gamma)
+        return gamma + mix_cfg.min_gamma
+
+    def _apply_mix_gamma(
+        self,
+        local_vectors: torch.Tensor,
+        mixed_vectors: torch.Tensor,
+        gamma: float,
+    ) -> torch.Tensor:
+        if gamma == 1.0:
+            return mixed_vectors
+        return local_vectors.lerp(mixed_vectors, gamma)
 
     @torch.no_grad()
     def _start_remote_peer_exchange(
@@ -607,7 +694,13 @@ class DecentralizedTrainer:
         return images, labels
 
     @torch.no_grad()
-    def _evaluate_epoch(self, epoch: int, train_loss: float, lr: float) -> EpochMetrics:
+    def _evaluate_epoch(
+        self,
+        epoch: int,
+        train_loss: float,
+        lr: float,
+        gamma: float = 1.0,
+    ) -> EpochMetrics:
         assert self.model is not None and self.param_storage is not None
         global_vector, d2c = self._global_average_vector_and_d2c()
         was_training = self.model.training
@@ -656,6 +749,8 @@ class DecentralizedTrainer:
             test_accuracy=test_accuracy,
             distance_to_consensus=d2c,
             lr=lr,
+            gamma=gamma,
+            accumulated_gamma=self.accumulated_gamma,
         )
 
     @torch.no_grad()

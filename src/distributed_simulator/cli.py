@@ -6,10 +6,12 @@ import sys
 from loguru import logger
 
 from distributed_simulator.config import (
+    AdaptiveMixConfig,
     ConstantSchedulerConfig,
     DataConfig,
     DecentralizedTrainerConfig,
     ModelConfig,
+    NormalMixConfig,
     OptimizerConfig,
     RuntimeConfig,
     SimulationConfig,
@@ -76,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable CUDA stream overlap between model mixing and gradient computation.",
     )
+    parser.add_argument("--mix", choices=["normal", "adaptive"], default="normal")
+    parser.add_argument("--adaptive-p", type=float, default=3.0)
+    parser.add_argument("--adaptive-max-gamma", type=float, default=1.0)
+    parser.add_argument("--adaptive-min-gamma", type=float, default=0.0)
+    parser.add_argument("--adaptive-start-epoch", type=int, default=10)
     parser.add_argument("--classes", type=int, default=3)
     parser.add_argument("--log-level", default="INFO", help="Loguru log level.")
     return parser
@@ -118,9 +125,20 @@ def config_from_args(args: argparse.Namespace) -> SimulationConfig:
         compile=args.compile,
         compile_mode=args.compile_mode,
     )
+    mix = (
+        NormalMixConfig()
+        if args.mix == "normal"
+        else AdaptiveMixConfig(
+            p=args.adaptive_p,
+            max_gamma=args.adaptive_max_gamma,
+            min_gamma=args.adaptive_min_gamma,
+            start_epoch=args.adaptive_start_epoch,
+        )
+    )
     trainer = DecentralizedTrainerConfig(
         topology=Topology(args.topology),
         overlap_mixing=not args.no_overlap_mixing,
+        mix=mix,
     )
     return SimulationConfig(
         virtual_workers=args.workers,
@@ -151,10 +169,12 @@ def main(argv: list[str] | None = None) -> None:
         if ctx.rank == 0:
             logger.info(
                 "Launching decentralized simulation: "
-                "workers={} processes={} topology={} model={} dataset={} device={} epochs={}",
+                "workers={} processes={} topology={} mix={} model={} dataset={} "
+                "device={} epochs={}",
                 run_cfg.virtual_workers,
                 ctx.world_size,
                 trainer_cfg.topology.value,
+                trainer_cfg.mix.name,
                 run_cfg.model.name.value,
                 run_cfg.data.dataset.value,
                 run_cfg.device,
@@ -171,9 +191,11 @@ def main(argv: list[str] | None = None) -> None:
             print(
                 "decentralized "
                 f"workers={cfg.virtual_workers} processes={ctx.world_size} "
-                f"topology={trainer_cfg.topology.value} epochs={metrics.epochs} "
+                f"topology={trainer_cfg.topology.value} mix={trainer_cfg.mix.name} "
+                f"epochs={metrics.epochs} "
                 f"steps={metrics.steps} "
-                f"loss={metrics.loss:.6f} d2c={metrics.distance_to_consensus:.6f}"
+                f"loss={metrics.loss:.6f} d2c={metrics.distance_to_consensus:.6f} "
+                f"gamma={metrics.gamma:.6f} accum_gamma={metrics.accumulated_gamma:.6f}"
             )
     finally:
         destroy_process_context()

@@ -3,8 +3,10 @@ from torch import nn
 
 from distributed_simulator import data as data_module
 from distributed_simulator.config import (
+    AdaptiveMixConfig,
     DecentralizedConfig,
     DecentralizedTrainerConfig,
+    NormalMixConfig,
     SimulationConfig,
     Topology,
     WarmupCosineSchedulerConfig,
@@ -261,9 +263,35 @@ def test_default_training_configuration_matches_requested_setup() -> None:
     assert isinstance(cfg.trainer, DecentralizedTrainerConfig)
     assert cfg.trainer.topology == Topology.RING
     assert cfg.trainer.overlap_mixing is True
+    assert isinstance(cfg.trainer.mix, NormalMixConfig)
 
 
 def test_decentralized_config_accepts_legacy_flat_topology() -> None:
     cfg = DecentralizedConfig.model_validate({"topology": Topology.COMPLETE})
 
     assert cfg.topology == Topology.COMPLETE
+
+
+def test_decentralized_config_accepts_adaptive_mix() -> None:
+    cfg = DecentralizedConfig.model_validate(
+        {
+            "trainer": {
+                "name": "decentralized",
+                "topology": "complete",
+                "mix": {
+                    "name": "adaptive",
+                    "p": 2.0,
+                    "max_gamma": 0.8,
+                    "min_gamma": 0.2,
+                    "start_epoch": 3,
+                },
+            }
+        }
+    )
+
+    assert isinstance(cfg.trainer, DecentralizedTrainerConfig)
+    assert isinstance(cfg.trainer.mix, AdaptiveMixConfig)
+    assert cfg.trainer.mix.p == 2.0
+    assert cfg.trainer.mix.max_gamma == 0.8
+    assert cfg.trainer.mix.min_gamma == 0.2
+    assert cfg.trainer.mix.start_epoch == 3
