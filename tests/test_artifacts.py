@@ -5,7 +5,7 @@ from datetime import datetime
 import torch
 from packed_resnet import WideResNet
 
-import distributed_simulator.trainer as trainer_module
+import distributed_simulator.trainers.base as trainer_base
 from distributed_simulator.artifacts import (
     create_run_dir,
     run_id_from_environment,
@@ -26,8 +26,7 @@ from distributed_simulator.config import (
 from distributed_simulator.data import DatasetName
 from distributed_simulator.distributed import ProcessContext
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainer import DecentralizedTrainer
-from distributed_simulator.trainers.base import EpochMetrics, TrainMetrics
+from distributed_simulator.trainers import DecentralizedTrainer, EpochMetrics, TrainMetrics
 
 
 def test_run_id_prefers_slurm_job_id(monkeypatch) -> None:
@@ -130,7 +129,7 @@ def test_decentralized_checkpoints_are_external_wide_resnet_state_dicts(
         def __len__(self) -> int:
             return self.images.size(0)
 
-    monkeypatch.setattr(trainer_module, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(trainer_base, "InMemoryCifar", FakeCifar)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),

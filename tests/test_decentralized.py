@@ -4,7 +4,7 @@ import sys
 import pytest
 import torch
 
-import distributed_simulator.trainer as trainer_module
+import distributed_simulator.trainers.base as trainer_base
 from distributed_simulator.config import (
     AdaptiveMixConfig,
     DataConfig,
@@ -20,7 +20,7 @@ from distributed_simulator.config import (
 from distributed_simulator.data import DatasetName, deterministic_worker_indices
 from distributed_simulator.distributed import ProcessContext, resolve_process_device
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainer import DecentralizedTrainer
+from distributed_simulator.trainers import DecentralizedTrainer
 
 
 def test_standard_decentralized_cpu_smoke_single_process() -> None:
@@ -519,7 +519,7 @@ def test_wide_resnet_cifar_trainer_smoke(monkeypatch) -> None:
             )
             return self.images.index_select(0, indices), self.labels.index_select(0, indices)
 
-    monkeypatch.setattr(trainer_module, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(trainer_base, "InMemoryCifar", FakeCifar)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
@@ -664,7 +664,7 @@ def test_cuda_bf16_amp_wrn_smoke_uses_batched_autograd(monkeypatch) -> None:
             )
             return self.images.index_select(0, indices), self.labels.index_select(0, indices)
 
-    monkeypatch.setattr(trainer_module, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(trainer_base, "InMemoryCifar", FakeCifar)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),

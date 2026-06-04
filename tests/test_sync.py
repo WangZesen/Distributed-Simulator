@@ -1,6 +1,6 @@
 import torch
 
-import distributed_simulator.trainer as trainer_module
+import distributed_simulator.trainers.sync as sync_module
 from distributed_simulator.config import (
     DataConfig,
     ModelConfig,
@@ -12,7 +12,7 @@ from distributed_simulator.config import (
 from distributed_simulator.data import DatasetName
 from distributed_simulator.distributed import ProcessContext
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainer import SyncTrainer
+from distributed_simulator.trainers import SyncTrainer
 
 
 def test_sync_cpu_smoke_single_process() -> None:
@@ -115,8 +115,8 @@ def test_sync_gradient_averaging_uses_one_coalesced_all_reduce(monkeypatch) -> N
         all_reduce_tensors.append(tensor.detach().clone())
         tensor.mul_(2)
 
-    monkeypatch.setattr(trainer_module.dist, "broadcast", fake_broadcast)
-    monkeypatch.setattr(trainer_module.dist, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(sync_module.dist, "broadcast", fake_broadcast)
+    monkeypatch.setattr(sync_module.dist, "all_reduce", fake_all_reduce)
     trainer = SyncTrainer(cfg, ProcessContext(rank=0, world_size=2))
     assert trainer.model is not None and trainer.param_storage is not None
 

@@ -16,7 +16,7 @@ from distributed_simulator.config import (
 from distributed_simulator.data import DatasetName
 from distributed_simulator.distributed import ProcessContext
 from distributed_simulator.model import ModelName
-from distributed_simulator.trainer import SAMTrainer
+from distributed_simulator.trainers import SAMTrainer
 
 
 def _sam_linear_config(**kwargs: object) -> SimulationConfig:

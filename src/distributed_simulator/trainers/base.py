@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -467,16 +466,14 @@ class BaseTrainer:
         return any(isinstance(module, NORM_MODULES) for module in self.model.modules())
 
     def _init_data(self, train: bool) -> InMemoryCifar | InMemorySyntheticImages:
-        cifar_cls = _compat_symbol("InMemoryCifar", InMemoryCifar)
-        synthetic_cls = _compat_symbol("InMemorySyntheticImages", InMemorySyntheticImages)
         if self.cfg.data.dataset == DatasetName.SYNTHETIC:
-            return synthetic_cls(
+            return InMemorySyntheticImages(
                 samples=self.cfg.virtual_workers * self.cfg.data.batch_size * 4,
                 num_classes=self.cfg.data.num_classes,
                 seed=self.cfg.data.seed if train else self.cfg.data.seed + 1,
                 device=self.device,
             )
-        return cifar_cls(
+        return InMemoryCifar(
             self.cfg.data.dataset,
             root=self.cfg.data.root,
             train=train,
@@ -657,7 +654,3 @@ def _foreach_mul_(tensors: list[torch.Tensor], scalar: float) -> None:
     foreach_mul = cast(Any, getattr(torch, _FOREACH_MUL_INPLACE))
     foreach_mul(tensors, scalar)
 
-
-def _compat_symbol(name: str, default: Any) -> Any:
-    shim = sys.modules.get("distributed_simulator.trainer")
-    return getattr(shim, name, default) if shim is not None else default
