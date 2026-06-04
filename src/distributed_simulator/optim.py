@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import torch
 from torch import nn
 
 NORM_MODULES = (
@@ -41,22 +40,6 @@ def parameter_decay_mask(module: nn.Module, weight_decay: float) -> dict[str, fl
             continue
         mask[name] = 0.0 if _is_bias_name(name) or name in norm_parameter_names else weight_decay
     return mask
-
-
-def functional_sgd_update(
-    params: dict[str, torch.Tensor],
-    grads: dict[str, torch.Tensor],
-    weight_decay_by_name: dict[str, float],
-    lr: float,
-) -> dict[str, torch.Tensor]:
-    updated = {}
-    for name, parameter in params.items():
-        grad = grads[name]
-        weight_decay = weight_decay_by_name.get(name, 0.0)
-        if weight_decay:
-            grad = grad.add(parameter, alpha=weight_decay)
-        updated[name] = parameter.add(grad, alpha=-lr)
-    return updated
 
 
 def _norm_parameter_names(module: nn.Module) -> set[str]:

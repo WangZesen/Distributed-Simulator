@@ -164,7 +164,7 @@ def test_complete_topology_uses_complete_mix_path(monkeypatch) -> None:
     def fail_pairwise_mix(*args, **kwargs):  # noqa: ANN002, ANN003
         raise AssertionError("complete topology should not use pairwise mixing")
 
-    monkeypatch.setattr(trainer, "_pairwise_topology_mix", fail_pairwise_mix)
+    monkeypatch.setattr(trainer, "_start_pairwise_topology_mix", fail_pairwise_mix)
     trainer.train()
 
 

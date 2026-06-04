@@ -335,24 +335,6 @@ class DecentralizedTrainer:
         )
 
     @torch.no_grad()
-    def _complete_graph_mix(self, local_vectors: torch.Tensor) -> torch.Tensor:
-        # Equal power-of-two sharding means every process owns the same number of
-        # virtual workers. One all-reduce on local means gives the global average.
-        local_mean = local_vectors.mean(dim=0)
-        if self.ctx.is_distributed:
-            logger.debug("Rank {} mixing complete topology with one all-reduce", self.ctx.rank)
-            dist.all_reduce(local_mean, op=dist.ReduceOp.SUM)
-            local_mean.div_(self.ctx.world_size)
-        return local_mean.expand_as(local_vectors).clone()
-
-    @torch.no_grad()
-    def _pairwise_topology_mix(self, local_vectors: torch.Tensor, step: int) -> torch.Tensor:
-        peer_by_rank = self._active_peer_by_rank(step)
-        exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
-        remote_peer_vectors = self._finish_remote_peer_exchange(exchange) if exchange else {}
-        return self._finish_pairwise_topology_mix(local_vectors, peer_by_rank, remote_peer_vectors)
-
-    @torch.no_grad()
     def _finish_pairwise_topology_mix(
         self,
         local_vectors: torch.Tensor,
@@ -371,18 +353,6 @@ class DecentralizedTrainer:
             else:
                 peer_vectors[local_index].copy_(remote_peer_vectors[peer])
         return local_vectors.add(peer_vectors).mul_(0.5)
-
-    @torch.no_grad()
-    def _exchange_remote_peer_vectors(
-        self,
-        local_vectors: torch.Tensor,
-        peer_by_rank: dict[int, int],
-    ) -> dict[int, torch.Tensor]:
-        if not self.ctx.is_distributed:
-            return {}
-
-        exchange = self._start_remote_peer_exchange(local_vectors, peer_by_rank)
-        return self._finish_remote_peer_exchange(exchange) if exchange else {}
 
     @torch.no_grad()
     def _start_remote_peer_exchange(
