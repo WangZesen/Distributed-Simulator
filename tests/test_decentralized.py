@@ -64,6 +64,37 @@ def test_synthetic_batches_are_image_shaped() -> None:
     assert labels.shape == (3, 2)
 
 
+def test_training_loop_consumes_prefetched_batches(monkeypatch) -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=1,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    prefetched_steps = []
+    waited_steps = []
+
+    class FakePrefetcher:
+        def prefetch(self, step: int):  # noqa: ANN202
+            prefetched_steps.append(step)
+            return step
+
+        def wait(self, batch):  # noqa: ANN001, ANN202
+            waited_steps.append(batch)
+            return trainer._batch_for_training_step(batch)
+
+    monkeypatch.setattr(trainer, "_build_batch_prefetcher", lambda: FakePrefetcher())
+
+    metrics = trainer.train()
+
+    assert metrics.steps == trainer.total_steps
+    assert prefetched_steps == list(range(trainer.total_steps))
+    assert waited_steps == list(range(trainer.total_steps))
+
+
 def test_decentralized_trainer_uses_packed_storage() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,

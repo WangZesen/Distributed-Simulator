@@ -95,6 +95,13 @@ class PendingMix:
     pairwise_exchange: PendingPairwiseExchange | None = None
 
 
+@dataclass
+class PrefetchedBatch:
+    inputs: torch.Tensor
+    targets: torch.Tensor
+    stream: torch.cuda.Stream
+
+
 class PackedStorageEntry(Protocol):
     name: str
     module_name: str
@@ -132,6 +139,24 @@ class PackedModel(Protocol):
     def sync_storage_from_parameters_(self) -> Self: ...
 
     def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self: ...
+
+
+class CudaBatchPrefetcher:
+    def __init__(self, trainer: DecentralizedTrainer):
+        self.trainer = trainer
+        self.stream = torch.cuda.Stream(device=trainer.device)
+
+    def prefetch(self, step: int) -> PrefetchedBatch:
+        with torch.cuda.stream(self.stream):
+            inputs, targets = self.trainer._batch_for_training_step(step)
+        return PrefetchedBatch(inputs=inputs, targets=targets, stream=self.stream)
+
+    def wait(self, batch: PrefetchedBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        current_stream = torch.cuda.current_stream(self.trainer.device)
+        current_stream.wait_stream(batch.stream)
+        batch.inputs.record_stream(current_stream)
+        batch.targets.record_stream(current_stream)
+        return batch.inputs, batch.targets
 
 
 def _peer_for_rank(rank: int, ranks: tuple[int, ...]) -> int:
@@ -221,16 +246,27 @@ class DecentralizedTrainer:
         epoch_loss_sum = torch.zeros((), device=self.device)
         completed_steps = 0
         history = []
+        prefetcher = self._build_batch_prefetcher()
+        prefetched_batch = (
+            prefetcher.prefetch(0) if prefetcher is not None and self.total_steps else None
+        )
         for step in range(self.total_steps):
             self.training_step = step
             current_lr = self._learning_rate(step)
             gamma = self._mixing_gamma(step, current_lr)
+            batch = None
+            if prefetcher is not None and prefetched_batch is not None:
+                batch = prefetcher.wait(prefetched_batch)
+                next_step = step + 1
+                prefetched_batch = (
+                    prefetcher.prefetch(next_step) if next_step < self.total_steps else None
+                )
             if self._use_cuda_mixing_overlap():
                 pending_mix = self._start_mixing(step, gamma=gamma)
-                loss = self._compute_local_gradients()
+                loss = self._compute_local_gradients(batch=batch)
                 self._finish_mixing(pending_mix)
             else:
-                loss = self._compute_local_gradients()
+                loss = self._compute_local_gradients(batch=batch)
                 self._mix_parameters(step, gamma=gamma)
             self._apply_optimizer_update(current_lr)
             self.accumulated_gamma += gamma
@@ -288,8 +324,11 @@ class DecentralizedTrainer:
             history=tuple(history),
         )
 
-    def _compute_local_gradients(self) -> torch.Tensor:
-        batch_inputs, batch_targets = self._next_batch()
+    def _compute_local_gradients(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        batch_inputs, batch_targets = batch if batch is not None else self._next_batch()
         assert self.model is not None
         self.model.train()
         self.model.zero_grad(set_to_none=True)
@@ -737,8 +776,11 @@ class DecentralizedTrainer:
         return epoch % _EVALUATION_INTERVAL_EPOCHS == 0 or epoch == self.cfg.epochs
 
     def _next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        epoch = self.training_step // self.batches_per_epoch
-        step = self.training_step % self.batches_per_epoch
+        return self._batch_for_training_step(self.training_step)
+
+    def _batch_for_training_step(self, training_step: int) -> tuple[torch.Tensor, torch.Tensor]:
+        epoch = training_step // self.batches_per_epoch
+        step = training_step % self.batches_per_epoch
         return self._batch_from_dataset(
             self.dataset,
             epoch=epoch,
@@ -782,6 +824,11 @@ class DecentralizedTrainer:
         images = torch.stack([batch[0] for batch in batches], dim=1)
         labels = torch.stack([batch[1] for batch in batches], dim=1)
         return images, labels
+
+    def _build_batch_prefetcher(self) -> CudaBatchPrefetcher | None:
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        return CudaBatchPrefetcher(self)
 
     @torch.no_grad()
     def _evaluate_epoch(
