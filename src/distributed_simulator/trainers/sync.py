@@ -32,7 +32,6 @@ class SyncTrainer(BaseTrainer):
             dtype=self.param_storage.dtype,
             device=self.param_storage.device,
         )
-        self._synchronize_initial_replicas_()
         logger.info(
             "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} backend=packed-sync",
             self.ctx.rank,
@@ -131,15 +130,6 @@ class SyncTrainer(BaseTrainer):
             owned_workers=self.owned_ranks,
             history=tuple(history),
         )
-
-    @torch.no_grad()
-    def _synchronize_initial_replicas_(self) -> None:
-        assert self.model is not None and self.param_storage is not None
-        source = self.param_storage[0].detach().clone()
-        if self.ctx.is_distributed:
-            dist.broadcast(source, src=0)
-        self.param_storage.copy_(source.expand_as(self.param_storage))
-        self.model.sync_parameters_from_storage_()
 
     @torch.no_grad()
     def _average_gradients_(self) -> None:

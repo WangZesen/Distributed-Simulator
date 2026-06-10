@@ -112,6 +112,35 @@ def test_decentralized_trainer_uses_packed_storage() -> None:
     assert hasattr(trainer.model, "parameter_storage_layout")
 
 
+def test_decentralized_initializes_all_replicas_from_rank_zero(monkeypatch) -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+    )
+    rank_zero_parameters = torch.linspace(-1.0, 1.0, 6146)
+    broadcasts = []
+
+    def fake_broadcast(tensor: torch.Tensor, src: int) -> None:
+        broadcasts.append((tensor, src))
+        tensor.copy_(rank_zero_parameters)
+
+    monkeypatch.setattr(trainer_base.dist, "broadcast", fake_broadcast)
+    trainer = DecentralizedTrainer(cfg, ProcessContext(rank=1, world_size=2))
+
+    assert trainer.param_storage is not None
+    assert len(broadcasts) == 1
+    assert broadcasts[0][1] == 0
+    assert torch.equal(trainer.param_storage[0], rank_zero_parameters)
+    assert torch.equal(
+        trainer.param_storage,
+        rank_zero_parameters.expand_as(trainer.param_storage),
+    )
+
+
 def test_resolve_process_device_maps_cuda_to_local_rank(monkeypatch) -> None:
     selected_devices = []
     monkeypatch.setenv("LOCAL_RANK", "1")
@@ -282,7 +311,7 @@ def test_exp_pairwise_peer_schedule_is_cached() -> None:
     assert trainer._active_peer_by_rank(2)[0] == 4
 
 
-def test_remote_pairwise_exchange_metadata_is_cached() -> None:
+def test_remote_pairwise_exchange_metadata_is_cached(monkeypatch) -> None:
     cfg = DecentralizedConfig(
         virtual_workers=4,
         trainer=DecentralizedTrainerConfig(topology=Topology.RING),
@@ -291,6 +320,7 @@ def test_remote_pairwise_exchange_metadata_is_cached() -> None:
         model=ModelConfig(name=ModelName.LINEAR),
         data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
     )
+    monkeypatch.setattr(trainer_base.dist, "broadcast", lambda tensor, src: None)
     trainer = DecentralizedTrainer(cfg, ProcessContext(rank=0, world_size=2))
 
     local_phase, remote_phase = trainer.pairwise_exchange_plans

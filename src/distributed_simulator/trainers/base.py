@@ -496,6 +496,7 @@ class BaseTrainer:
         self._model_forward = self._build_model_forward()
         param_storage = self.model.parameter_storage
         self.param_storage = param_storage
+        self._synchronize_initial_replicas_()
         self._init_optimizer_parameters(
             parameter_decay_mask(cast(nn.Module, self.model), self.cfg.optimizer.weight_decay)
         )
@@ -507,6 +508,15 @@ class BaseTrainer:
             len(tuple(self.model.named_parameters())),
             param_storage.size(1),
         )
+
+    @torch.no_grad()
+    def _synchronize_initial_replicas_(self) -> None:
+        assert self.model is not None and self.param_storage is not None
+        source = self.param_storage[0].detach().clone()
+        if self.ctx.is_distributed:
+            dist.broadcast(source, src=0)
+        self.param_storage.copy_(source.expand_as(self.param_storage))
+        self.model.sync_parameters_from_storage_()
 
     def _build_model_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
         assert self.model is not None
@@ -653,4 +663,3 @@ def _foreach_add(
 def _foreach_mul_(tensors: list[torch.Tensor], scalar: float) -> None:
     foreach_mul = cast(Any, getattr(torch, _FOREACH_MUL_INPLACE))
     foreach_mul(tensors, scalar)
-
