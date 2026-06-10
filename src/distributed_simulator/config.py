@@ -57,7 +57,6 @@ SchedulerConfig = Annotated[
 class DataConfig(_ConfigModel):
     dataset: DatasetName = DatasetName.CIFAR10
     root: Path = Path("data")
-    download: bool = True
     augment: bool = True
     num_classes: int = Field(default=10, gt=1)
     batch_size: int = Field(default=16, gt=0)
@@ -199,9 +198,13 @@ def merge_dicts_recursive(base: dict[str, Any], override: dict[str, Any]) -> dic
     merged = dict(base)
     for key, value in override.items():
         current = merged.get(key)
-        if isinstance(current, dict) and isinstance(value, dict) and not _changes_named_block(
-            current,
-            value,
+        if (
+            isinstance(current, dict)
+            and isinstance(value, dict)
+            and not _changes_named_block(
+                current,
+                value,
+            )
         ):
             merged[key] = merge_dicts_recursive(current, value)
         else:

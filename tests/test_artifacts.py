@@ -3,7 +3,7 @@ import tomllib
 from datetime import datetime
 
 import torch
-from packed_resnet import WideResNet
+from packed_resnet import PackedDataLoader, WideResNet
 
 import distributed_simulator.trainers.base as trainer_base
 from distributed_simulator.artifacts import (
@@ -129,14 +129,33 @@ def test_decentralized_checkpoints_are_external_wide_resnet_state_dicts(
         def __len__(self) -> int:
             return self.images.size(0)
 
-    monkeypatch.setattr(trainer_base, "InMemoryCifar", FakeCifar)
+    def fake_loader(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        del args
+        device = kwargs["device"]
+        return PackedDataLoader(
+            torch.randn(16, 3, 32, 32, device=device),
+            torch.arange(16, device=device) % 10,
+            local_batch_size=kwargs["local_batch_size"],
+            world_size=kwargs["world_size"],
+            ranks=kwargs["ranks"],
+            base_seed=kwargs["base_seed"],
+            packed=True,
+            channels_last=True,
+            shuffle=kwargs["shuffle"],
+            augment=False,
+            normalize=False,
+            sampler_drop_last=kwargs["sampler_drop_last"],
+            drop_last=kwargs["drop_last"],
+        )
+
+    monkeypatch.setattr(trainer_base, "create_dataloader", fake_loader)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
         epochs=0,
         device="cpu",
         model=ModelConfig(name=ModelName.WRN_16_1),
-        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2, download=False),
+        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2),
         logging=LoggingConfig(root=tmp_path / "logs", save_last_checkpoint=True),
     )
     trainer = DecentralizedTrainer(cfg, ProcessContext())

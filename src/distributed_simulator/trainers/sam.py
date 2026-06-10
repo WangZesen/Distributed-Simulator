@@ -6,6 +6,7 @@ from loguru import logger
 
 from distributed_simulator.config import SAMTrainerConfig, SimulationConfig
 from distributed_simulator.distributed import ProcessContext
+from distributed_simulator.model import packed_parameter_view
 from distributed_simulator.trainers.base import BaseTrainer, TrainMetrics
 
 
@@ -27,20 +28,16 @@ class SAMTrainer(BaseTrainer):
         self._foreach_parameters = []
         self._foreach_perturbations = []
         self._foreach_base_parameters = []
-        for item in self.model.parameter_storage_layout():
+        for item in self.param_layout:
             parameter = self._parameter_by_storage_name[item.name]
             if not parameter.requires_grad:
                 continue
             self._foreach_parameters.append(parameter)
             self._foreach_perturbations.append(
-                self._perturbation_buffer[:, item.start : item.start + item.numel].view_as(
-                    parameter,
-                )
+                self._perturbation_buffer[:, item.start : item.start + item.numel]
             )
             self._foreach_base_parameters.append(
-                self._base_parameter_buffer[:, item.start : item.start + item.numel].view_as(
-                    parameter,
-                )
+                self._base_parameter_buffer[:, item.start : item.start + item.numel]
             )
         self._sam_scale_buffer = torch.empty(
             self.local_worker_count,
@@ -166,7 +163,13 @@ class SAMTrainer(BaseTrainer):
 
         second_loss = self._compute_local_gradients((batch_inputs, batch_targets))
         with torch.no_grad():
-            torch._foreach_copy_(self._foreach_parameters, self._foreach_base_parameters)
+            torch._foreach_copy_(
+                [
+                    packed_parameter_view(parameter, self.local_worker_count)
+                    for parameter in self._foreach_parameters
+                ],
+                self._foreach_base_parameters,
+            )
             self.model.sync_storage_from_parameters_()
         return second_loss
 
@@ -180,7 +183,13 @@ class SAMTrainer(BaseTrainer):
         self._sam_scale_buffer.mul_(trainer_cfg.rho)
         self._perturbation_buffer.copy_(self._gradient_storage_buffer)
         self._perturbation_buffer.mul_(self._sam_scale_buffer.unsqueeze(1))
-        torch._foreach_add_(self._foreach_parameters, self._foreach_perturbations)
+        torch._foreach_add_(
+            [
+                packed_parameter_view(parameter, self.local_worker_count)
+                for parameter in self._foreach_parameters
+            ],
+            self._foreach_perturbations,
+        )
         self.model.sync_storage_from_parameters_()
         self.model.zero_grad(set_to_none=True)
 
@@ -188,13 +197,13 @@ class SAMTrainer(BaseTrainer):
     def _average_gradients_(self) -> None:
         assert self.model is not None
         averaged = self._coalesced_averaged_gradient_()
-        for item in self.model.parameter_storage_layout():
+        for item in self.param_layout:
             parameter = self._parameter_by_storage_name[item.name]
             if parameter.grad is None:
                 continue
             segment = averaged[item.start : item.start + item.numel]
-            grad_by_worker = parameter.grad.reshape(self.local_worker_count, -1)
-            parameter.grad.copy_(segment.expand_as(grad_by_worker).reshape_as(parameter.grad))
+            grad_by_worker = packed_parameter_view(parameter.grad, self.local_worker_count)
+            grad_by_worker.copy_(segment.expand_as(grad_by_worker))
         self._refresh_optimizer_gradients()
 
     def _coalesced_averaged_gradient_(self) -> torch.Tensor:
@@ -210,10 +219,10 @@ class SAMTrainer(BaseTrainer):
     def _pack_current_gradients_(self, gradient_storage: torch.Tensor) -> None:
         assert self.model is not None
         gradient_storage.zero_()
-        for item in self.model.parameter_storage_layout():
+        for item in self.param_layout:
             parameter = self._parameter_by_storage_name[item.name]
             if parameter.grad is None:
                 continue
             gradient_storage[:, item.start : item.start + item.numel].copy_(
-                parameter.grad.detach().reshape(self.local_worker_count, -1)
+                packed_parameter_view(parameter.grad.detach(), self.local_worker_count)
             )

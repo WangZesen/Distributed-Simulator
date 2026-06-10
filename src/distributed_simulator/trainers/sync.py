@@ -6,6 +6,7 @@ from loguru import logger
 
 from distributed_simulator.config import SimulationConfig, SyncTrainerConfig
 from distributed_simulator.distributed import ProcessContext
+from distributed_simulator.model import packed_parameter_view
 from distributed_simulator.trainers.base import BaseTrainer, TrainMetrics
 
 
@@ -135,25 +136,25 @@ class SyncTrainer(BaseTrainer):
     def _average_gradients_(self) -> None:
         assert self.model is not None
         averaged = self._coalesced_averaged_gradient_()
-        for item in self.model.parameter_storage_layout():
+        for item in self.param_layout:
             parameter = self._parameter_by_storage_name[item.name]
             if parameter.grad is None:
                 continue
             segment = averaged[item.start : item.start + item.numel]
-            grad_by_worker = parameter.grad.reshape(self.local_worker_count, -1)
-            parameter.grad.copy_(segment.expand_as(grad_by_worker).reshape_as(parameter.grad))
+            grad_by_worker = packed_parameter_view(parameter.grad, self.local_worker_count)
+            grad_by_worker.copy_(segment.expand_as(grad_by_worker))
         self._refresh_optimizer_gradients()
 
     def _coalesced_averaged_gradient_(self) -> torch.Tensor:
         assert self.model is not None
         gradient_storage = self._gradient_storage_buffer
         gradient_storage.zero_()
-        for item in self.model.parameter_storage_layout():
+        for item in self.param_layout:
             parameter = self._parameter_by_storage_name[item.name]
             if parameter.grad is None:
                 continue
             gradient_storage[:, item.start : item.start + item.numel].copy_(
-                parameter.grad.detach().reshape(self.local_worker_count, -1)
+                packed_parameter_view(parameter.grad.detach(), self.local_worker_count)
             )
 
         averaged = self._averaged_gradient_buffer

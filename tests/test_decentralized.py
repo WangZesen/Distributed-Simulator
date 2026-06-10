@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import torch
+from packed_resnet import PackedDataLoader
 
 import distributed_simulator.trainers.base as trainer_base
 from distributed_simulator.config import (
@@ -21,6 +22,29 @@ from distributed_simulator.data import DatasetName, deterministic_worker_indices
 from distributed_simulator.distributed import ProcessContext, resolve_process_device
 from distributed_simulator.model import ModelName
 from distributed_simulator.trainers import DecentralizedTrainer
+
+
+def _fake_packed_cifar_loader(*args, **kwargs) -> PackedDataLoader:  # noqa: ANN002
+    del args
+    device = torch.device(kwargs["device"])
+    generator = torch.Generator(device="cpu").manual_seed(123)
+    images = torch.rand(16, 3, 32, 32, generator=generator).to(device)
+    targets = (torch.arange(16) % 10).to(device)
+    return PackedDataLoader(
+        images,
+        targets,
+        local_batch_size=kwargs["local_batch_size"],
+        world_size=kwargs["world_size"],
+        ranks=kwargs["ranks"],
+        base_seed=kwargs["base_seed"],
+        packed=kwargs["packed"],
+        channels_last=kwargs["channels_last"],
+        shuffle=kwargs["shuffle"],
+        augment=False,
+        normalize=False,
+        sampler_drop_last=kwargs["sampler_drop_last"],
+        drop_last=kwargs["drop_last"],
+    )
 
 
 def test_standard_decentralized_cpu_smoke_single_process() -> None:
@@ -109,7 +133,7 @@ def test_decentralized_trainer_uses_packed_storage() -> None:
     assert trainer.param_storage is not None
     assert trainer._local_vectors() is trainer.param_storage
     assert trainer.model is not None
-    assert hasattr(trainer.model, "parameter_storage_layout")
+    assert trainer.param_layout
 
 
 def test_decentralized_initializes_all_replicas_from_rank_zero(monkeypatch) -> None:
@@ -121,11 +145,13 @@ def test_decentralized_initializes_all_replicas_from_rank_zero(monkeypatch) -> N
         model=ModelConfig(name=ModelName.LINEAR),
         data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
     )
-    rank_zero_parameters = torch.linspace(-1.0, 1.0, 6146)
+    rank_zero_parameters = None
     broadcasts = []
 
     def fake_broadcast(tensor: torch.Tensor, src: int) -> None:
+        nonlocal rank_zero_parameters
         broadcasts.append((tensor, src))
+        rank_zero_parameters = torch.linspace(-1.0, 1.0, tensor.numel())
         tensor.copy_(rank_zero_parameters)
 
     monkeypatch.setattr(trainer_base.dist, "broadcast", fake_broadcast)
@@ -134,6 +160,7 @@ def test_decentralized_initializes_all_replicas_from_rank_zero(monkeypatch) -> N
     assert trainer.param_storage is not None
     assert len(broadcasts) == 1
     assert broadcasts[0][1] == 0
+    assert rank_zero_parameters is not None
     assert torch.equal(trainer.param_storage[0], rank_zero_parameters)
     assert torch.equal(
         trainer.param_storage,
@@ -479,8 +506,8 @@ def test_sgd_update_uses_configured_momentum() -> None:
     assert trainer.model is not None
 
     parameters = dict(trainer.model.named_parameters())
-    weight = parameters["weight"]
-    bias = parameters["bias"]
+    weight = next(value for name, value in parameters.items() if name.endswith("weight"))
+    bias = next(value for name, value in parameters.items() if name.endswith("bias"))
     with torch.no_grad():
         weight.fill_(2.0)
         bias.fill_(0.5)
@@ -549,7 +576,7 @@ def test_wide_resnet_cifar_trainer_smoke(monkeypatch) -> None:
             )
             return self.images.index_select(0, indices), self.labels.index_select(0, indices)
 
-    monkeypatch.setattr(trainer_base, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(trainer_base, "create_dataloader", _fake_packed_cifar_loader)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
@@ -557,7 +584,7 @@ def test_wide_resnet_cifar_trainer_smoke(monkeypatch) -> None:
         device="cpu",
         model=ModelConfig(name=ModelName.WRN_16_1),
         optimizer=OptimizerConfig(lr=0.0),
-        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2, download=False),
+        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2),
     )
     metrics = DecentralizedTrainer(cfg, ProcessContext()).train()
 
@@ -565,6 +592,38 @@ def test_wide_resnet_cifar_trainer_smoke(monkeypatch) -> None:
     assert metrics.steps == 4
     assert metrics.owned_workers == (0, 1)
     assert torch.isfinite(torch.tensor(metrics.loss))
+
+
+def test_cifar_trainer_uses_packed_resnet_factory(monkeypatch) -> None:
+    calls = []
+
+    def record_factory(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        calls.append((args, kwargs))
+        return _fake_packed_cifar_loader(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_base, "create_dataloader", record_factory)
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.WRN_16_1),
+        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2, eval_batch_size=4),
+        runtime=RuntimeConfig(amp=False, compile=False),
+    )
+
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    images, targets = trainer._next_batch()
+
+    assert len(calls) == 2
+    assert calls[0][0] == ("cifar10",)
+    assert calls[0][1]["world_size"] == 4
+    assert calls[0][1]["ranks"] == (0, 1, 2, 3)
+    assert calls[0][1]["packed"] is True
+    assert calls[0][1]["channels_last"] is True
+    assert images.shape == (2, 12, 32, 32)
+    assert images.is_contiguous(memory_format=torch.channels_last)
+    assert targets.shape == (2, 4)
 
 
 def test_warmup_epochs_are_converted_to_update_steps() -> None:
@@ -694,7 +753,7 @@ def test_cuda_bf16_amp_wrn_smoke_uses_batched_autograd(monkeypatch) -> None:
             )
             return self.images.index_select(0, indices), self.labels.index_select(0, indices)
 
-    monkeypatch.setattr(trainer_base, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(trainer_base, "create_dataloader", _fake_packed_cifar_loader)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
@@ -706,7 +765,6 @@ def test_cuda_bf16_amp_wrn_smoke_uses_batched_autograd(monkeypatch) -> None:
             dataset=DatasetName.CIFAR10,
             batch_size=2,
             eval_batch_size=8,
-            download=False,
         ),
         runtime=RuntimeConfig(amp=True, amp_dtype="bf16"),
     )

@@ -10,16 +10,20 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
+from packed_resnet import PackedDataLoader, create_dataloader
 
 from distributed_simulator.config import SimulationConfig
 from distributed_simulator.data import (
     DatasetName,
-    InMemoryCifar,
     InMemorySyntheticImages,
     num_classes_for_dataset,
 )
 from distributed_simulator.distributed import ProcessContext, all_gather_owned_buckets
-from distributed_simulator.model import get_packed_model
+from distributed_simulator.model import (
+    PackedParameterLayout,
+    get_packed_model,
+    parameter_storage_layout,
+)
 from distributed_simulator.optim import NORM_MODULES, parameter_decay_mask
 from distributed_simulator.parameters import average_distance_to_consensus
 from distributed_simulator.scheduler import lr_factor
@@ -66,16 +70,6 @@ class PrefetchedBatch:
     stream: torch.cuda.Stream
 
 
-class PackedStorageEntry(Protocol):
-    name: str
-    module_name: str
-    parameter_name: str
-    start: int
-    numel: int
-    padded_numel: int
-    shape: tuple[int, ...]
-
-
 class PackedModel(Protocol):
     parameter_storage: torch.Tensor
     training: bool
@@ -96,13 +90,9 @@ class PackedModel(Protocol):
 
     def named_buffers(self) -> Iterator[tuple[str, torch.Tensor]]: ...
 
-    def get_submodule(self, target: str) -> nn.Module: ...
-
-    def parameter_storage_layout(self) -> tuple[PackedStorageEntry, ...]: ...
-
     def sync_storage_from_parameters_(self) -> Self: ...
 
-    def sync_parameters_from_storage_(self, include_conv: bool = True) -> Self: ...
+    def sync_parameters_from_storage_(self) -> Self: ...
 
 
 class CudaBatchPrefetcher:
@@ -137,6 +127,9 @@ class BaseTrainer:
         self.local_index_by_rank = {rank: i for i, rank in enumerate(self.owned_ranks)}
         self.dataset = self._init_data(train=True)
         self.test_dataset = self._init_data(train=False)
+        self._epoch_batch_cache: dict[
+            int, tuple[int, tuple[tuple[torch.Tensor, torch.Tensor], ...]]
+        ] = {}
         self.training_step = 0
         self.batches_per_epoch = self._batches_per_epoch()
         self.test_batch_size = self._test_batch_size()
@@ -145,6 +138,7 @@ class BaseTrainer:
         self.model: PackedModel | None = None
         self._model_forward: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.param_storage: torch.Tensor | None = None
+        self.param_layout: tuple[PackedParameterLayout, ...] = ()
         self.decay_parameters: list[torch.Tensor] = []
         self.no_decay_parameters: list[torch.Tensor] = []
         self.active_decay_parameters: list[torch.Tensor] = []
@@ -255,14 +249,20 @@ class BaseTrainer:
         return buffers
 
     def _batches_per_epoch(self) -> int:
+        if isinstance(self.dataset, PackedDataLoader):
+            return len(self.dataset)
         shard_size = len(self.dataset) // self.cfg.virtual_workers
         return max(shard_size // self.cfg.data.batch_size, 1)
 
     def _test_batches_per_epoch(self) -> int:
+        if isinstance(self.test_dataset, PackedDataLoader):
+            return len(self.test_dataset)
         shard_size = len(self.test_dataset) // self.cfg.virtual_workers
         return max(shard_size // self.test_batch_size, 1)
 
     def _test_batch_size(self) -> int:
+        if isinstance(self.test_dataset, PackedDataLoader):
+            return self.test_dataset.local_batch_size
         shard_size = len(self.test_dataset) // self.cfg.virtual_workers
         if shard_size < 1:
             raise ValueError("test worker shard is empty; reduce virtual_workers")
@@ -301,7 +301,7 @@ class BaseTrainer:
 
     def _batch_from_dataset(
         self,
-        dataset: InMemoryCifar | InMemorySyntheticImages,
+        dataset: PackedDataLoader | InMemorySyntheticImages,
         epoch: int,
         step: int,
         seed: int,
@@ -309,6 +309,17 @@ class BaseTrainer:
         batch_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = batch_size or self.cfg.data.batch_size
+        if isinstance(dataset, PackedDataLoader):
+            if batch_size != dataset.local_batch_size:
+                raise ValueError("PackedDataLoader batch size is fixed at creation")
+            cached = self._epoch_batch_cache.get(id(dataset))
+            if cached is None or cached[0] != epoch:
+                dataset.set_epoch(epoch)
+                batches = tuple(dataset)
+                self._epoch_batch_cache[id(dataset)] = (epoch, batches)
+            else:
+                batches = cached[1]
+            return batches[step % len(batches)]
         if hasattr(dataset, "batch_for_workers"):
             return dataset.batch_for_workers(
                 worker_ranks=self.owned_ranks,
@@ -465,7 +476,7 @@ class BaseTrainer:
         assert self.model is not None
         return any(isinstance(module, NORM_MODULES) for module in self.model.modules())
 
-    def _init_data(self, train: bool) -> InMemoryCifar | InMemorySyntheticImages:
+    def _init_data(self, train: bool) -> PackedDataLoader | InMemorySyntheticImages:
         if self.cfg.data.dataset == DatasetName.SYNTHETIC:
             return InMemorySyntheticImages(
                 samples=self.cfg.virtual_workers * self.cfg.data.batch_size * 4,
@@ -473,13 +484,28 @@ class BaseTrainer:
                 seed=self.cfg.data.seed if train else self.cfg.data.seed + 1,
                 device=self.device,
             )
-        return InMemoryCifar(
-            self.cfg.data.dataset,
+        local_batch_size = self.cfg.data.batch_size if train else self.cfg.data.eval_batch_size
+        loader = create_dataloader(
+            self.cfg.data.dataset.value.lower(),
             root=self.cfg.data.root,
+            local_batch_size=local_batch_size,
+            world_size=self.cfg.virtual_workers,
+            ranks=self.owned_ranks,
+            base_seed=self.cfg.data.seed if train else self.cfg.data.seed + 17_071,
             train=train,
+            packed=True,
+            channels_last=True,
+            shuffle=train,
+            augment=self.cfg.data.augment if train else False,
             device=self.device,
-            download=self.cfg.data.download,
+            sampler_drop_last=train,
+            drop_last=train,
         )
+        if len(loader) == 0:
+            raise ValueError(
+                "CIFAR worker shard has no complete batches; reduce virtual_workers or batch_size"
+            )
+        return loader
 
     def _init_packed_model(self) -> None:
         torch.manual_seed(self.cfg.seed)
@@ -496,6 +522,10 @@ class BaseTrainer:
         self._model_forward = self._build_model_forward()
         param_storage = self.model.parameter_storage
         self.param_storage = param_storage
+        self.param_layout = parameter_storage_layout(
+            cast(nn.Module, self.model),
+            self.local_worker_count,
+        )
         self._synchronize_initial_replicas_()
         self._init_optimizer_parameters(
             parameter_decay_mask(cast(nn.Module, self.model), self.cfg.optimizer.weight_decay)
@@ -603,8 +633,8 @@ class BaseTrainer:
 
     def _packed_storage_value(self, name: str) -> torch.Tensor:
         assert self.model is not None and self.param_storage is not None
-        for item in self.model.parameter_storage_layout():
-            if item.name == name:
+        for item in self.param_layout:
+            if item.name == name or item.name.endswith(f".{name}"):
                 return self.param_storage[:, item.start : item.start + item.numel].view(
                     self.local_worker_count,
                     *item.shape,

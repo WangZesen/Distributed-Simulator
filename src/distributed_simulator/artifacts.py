@@ -162,8 +162,8 @@ def _local_linear_state_dicts(trainer: BaseTrainer) -> list[tuple[int, dict[str,
         single = get_model(ModelName.LINEAR, trainer.cfg.data.num_classes)
         single.to(device=trainer.device)
         state = single.state_dict()
-        state["fc.weight"].copy_(cast(Any, model).weight[local_idx])
-        state["fc.bias"].copy_(cast(Any, model).bias[local_idx])
+        state["layers.0.weight"].copy_(cast(Any, model).weight[local_idx])
+        state["layers.0.bias"].copy_(cast(Any, model).bias[local_idx])
         states.append((worker_rank, _state_dict_to_cpu(state)))
     return states
 

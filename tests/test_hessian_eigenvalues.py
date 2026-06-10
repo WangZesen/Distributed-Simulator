@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from packed_resnet import WideResNet
+from packed_resnet import PackedDataLoader, WideResNet
 
 import distributed_simulator.eval_hessian_eigenvalues as eval_module
 from distributed_simulator.artifacts import save_resolved_config
@@ -29,6 +29,26 @@ from distributed_simulator.hessian_eigenvalues import (
     lanczos_eigenvalues,
 )
 from distributed_simulator.model import ModelName, get_model
+
+
+def _fake_cifar_factory(*args, **kwargs) -> PackedDataLoader:  # noqa: ANN002
+    del args
+    device = kwargs["device"]
+    images = torch.arange(6 * 3 * 32 * 32, dtype=torch.float32, device=device).view(6, 3, 32, 32)
+    labels = torch.arange(6, device=device)
+    return PackedDataLoader(
+        images,
+        labels,
+        local_batch_size=kwargs["local_batch_size"],
+        world_size=kwargs["world_size"],
+        ranks=kwargs["ranks"],
+        base_seed=kwargs["base_seed"],
+        packed=False,
+        channels_last=True,
+        shuffle=kwargs["shuffle"],
+        augment=kwargs["augment"],
+        normalize=False,
+    )
 
 
 def test_full_dataset_hvp_matches_explicit_autograd_average() -> None:
@@ -132,7 +152,7 @@ def test_load_model_accepts_saved_external_wide_resnet_checkpoint(tmp_path) -> N
         epochs=0,
         device="cpu",
         model=ModelConfig(name=ModelName.WRN_16_1),
-        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2, download=False),
+        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2),
         logging=LoggingConfig(root=tmp_path / "logs"),
     )
     saved = WideResNet(depth=16, widen_factor=1, num_classes=10)
@@ -187,7 +207,7 @@ def test_evaluation_batch_can_use_augmented_cifar_data(monkeypatch, tmp_path) ->
             self.mean = torch.zeros(1, 3, 1, 1, device=device)
             self.std = torch.ones(1, 3, 1, 1, device=device)
 
-    monkeypatch.setattr(eval_module, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(eval_module, "create_dataloader", _fake_cifar_factory)
     cfg = SimulationConfig(
         virtual_workers=1,
         epochs=0,
@@ -197,7 +217,6 @@ def test_evaluation_batch_can_use_augmented_cifar_data(monkeypatch, tmp_path) ->
             dataset=DatasetName.CIFAR10,
             batch_size=2,
             num_classes=10,
-            download=False,
         ),
         logging=LoggingConfig(root=tmp_path / "logs"),
     )
@@ -236,7 +255,7 @@ def test_evaluation_batch_shuffles_with_fixed_data_seed(monkeypatch, tmp_path) -
             self.mean = torch.zeros(1, 3, 1, 1, device=device)
             self.std = torch.ones(1, 3, 1, 1, device=device)
 
-    monkeypatch.setattr(eval_module, "InMemoryCifar", FakeCifar)
+    monkeypatch.setattr(eval_module, "create_dataloader", _fake_cifar_factory)
     cfg = SimulationConfig(
         virtual_workers=1,
         epochs=0,
@@ -246,7 +265,6 @@ def test_evaluation_batch_shuffles_with_fixed_data_seed(monkeypatch, tmp_path) -
             dataset=DatasetName.CIFAR10,
             batch_size=2,
             num_classes=10,
-            download=False,
             seed=17,
         ),
         logging=LoggingConfig(root=tmp_path / "logs"),
@@ -260,7 +278,9 @@ def test_evaluation_batch_shuffles_with_fixed_data_seed(monkeypatch, tmp_path) -
         augment=False,
     )
 
-    generator = torch.Generator(device="cpu").manual_seed(cfg.data.seed)
+    generator = torch.Generator(device="cpu").manual_seed(
+        cfg.data.seed + eval_module.EVALUATION_EPOCH
+    )
     expected = torch.randperm(6, generator=generator)[:3]
     assert torch.equal(labels, expected)
     assert not torch.equal(labels, torch.arange(3))

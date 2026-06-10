@@ -10,14 +10,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from loguru import logger
-from packed_resnet import WideResNet
+from packed_resnet import WideResNet, create_dataloader
 
 from distributed_simulator.config import SimulationConfig, load_config_files
 from distributed_simulator.data import (
     DatasetName,
-    InMemoryCifar,
     InMemorySyntheticImages,
-    deterministic_cifar_augment,
     num_classes_for_dataset,
 )
 from distributed_simulator.distributed import (
@@ -229,9 +227,7 @@ def _prepare_model_buffers_and_mode(
 
 def _batch_norm_layers(model: nn.Module) -> list[nn.modules.batchnorm._BatchNorm]:
     return [
-        module
-        for module in model.modules()
-        if isinstance(module, nn.modules.batchnorm._BatchNorm)
+        module for module in model.modules() if isinstance(module, nn.modules.batchnorm._BatchNorm)
     ]
 
 
@@ -254,18 +250,22 @@ def _calibrate_batch_norm(
         layer.reset_running_stats()
 
     model.train()
-    images, mean, std = _calibration_images(cfg, device, ctx)
-    for step, start in enumerate(range(0, images.size(0), batch_size)):
-        batch = images[start : start + batch_size]
-        if mean is not None and std is not None:
-            batch = deterministic_cifar_augment(
-                batch,
-                seed=cfg.data.seed,
-                epoch=CALIBRATION_EPOCH,
-                step=step,
-                worker_rank=ctx.rank,
-            ) if augment else batch
-            batch = batch.sub(mean).div(std)
+    if cfg.data.dataset == DatasetName.SYNTHETIC:
+        images, _, _ = _calibration_images(cfg, device, ctx)
+        batches = (
+            images[start : start + batch_size] for start in range(0, images.size(0), batch_size)
+        )
+    else:
+        loader = _create_cifar_loader(
+            cfg,
+            device,
+            ctx,
+            batch_size=batch_size,
+            augment=augment,
+        )
+        loader.set_epoch(CALIBRATION_EPOCH)
+        batches = (images for images, _ in loader)
+    for batch in batches:
         model(batch)
 
     if ctx.is_distributed:
@@ -298,18 +298,13 @@ def _calibration_images(
         mean = None
         std = None
     else:
-        dataset = InMemoryCifar(
-            cfg.data.dataset,
-            root=cfg.data.root,
-            train=True,
-            device=device,
-            download=cfg.data.download,
-        )
-        images = dataset.images
-        mean = dataset.mean
-        std = dataset.std
+        loader = _create_cifar_loader(cfg, device, ctx, batch_size=cfg.data.eval_batch_size)
+        loader.set_epoch(CALIBRATION_EPOCH)
+        images = torch.cat([batch for batch, _ in loader])
+        mean = None
+        std = None
 
-    if ctx.is_distributed:
+    if ctx.is_distributed and cfg.data.dataset == DatasetName.SYNTHETIC:
         images = images[ctx.rank :: ctx.world_size].contiguous()
     if images.size(0) == 0:
         raise ValueError("this process received no calibration samples")
@@ -333,48 +328,63 @@ def _evaluation_batch(
         )
         images = dataset.images
         labels = dataset.labels
-        mean = None
-        std = None
     else:
-        dataset = InMemoryCifar(
-            cfg.data.dataset,
-            root=cfg.data.root,
-            train=True,
-            device=device,
-            download=cfg.data.download,
+        loader = _create_cifar_loader(
+            cfg,
+            device,
+            ctx,
+            batch_size=cfg.data.eval_batch_size,
+            augment=augment,
         )
-        images = dataset.images
-        labels = dataset.labels
-        mean = dataset.mean
-        std = dataset.std
+        loader.set_epoch(EVALUATION_EPOCH)
+        batches = tuple(loader)
+        images = torch.cat([batch_images for batch_images, _ in batches])
+        labels = torch.cat([batch_labels for _, batch_labels in batches])
 
-    generator = torch.Generator(device=device)
-    generator.manual_seed(cfg.data.seed)
-    order = torch.randperm(images.size(0), generator=generator, device=device)
-    images = images.index_select(0, order)
-    labels = labels.index_select(0, order)
+    if cfg.data.dataset == DatasetName.SYNTHETIC:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(cfg.data.seed)
+        order = torch.randperm(images.size(0), generator=generator, device=device)
+        images = images.index_select(0, order)
+        labels = labels.index_select(0, order)
 
     selected = int(images.size(0) * data_fraction)
     if selected < 1:
         raise ValueError("--data-fraction selects no samples")
     images = images[:selected]
     labels = labels[:selected]
-    if ctx.is_distributed:
+    if ctx.is_distributed and cfg.data.dataset == DatasetName.SYNTHETIC:
         images = images[ctx.rank :: ctx.world_size].contiguous()
         labels = labels[ctx.rank :: ctx.world_size].contiguous()
     if images.size(0) == 0:
         raise ValueError("this process received no HVP samples; increase --data-fraction")
-    if mean is not None and std is not None:
-        if augment:
-            images = deterministic_cifar_augment(
-                images,
-                seed=cfg.data.seed,
-                epoch=EVALUATION_EPOCH,
-                step=0,
-                worker_rank=ctx.rank,
-            )
-        images = images.sub(mean).div(std)
+    if images.ndim == 4:
+        images = images.contiguous(memory_format=torch.channels_last)
     return images, labels
+
+
+def _create_cifar_loader(
+    cfg: SimulationConfig,
+    device: torch.device,
+    ctx: ProcessContext,
+    *,
+    batch_size: int,
+    augment: bool = False,
+):
+    return create_dataloader(
+        cfg.data.dataset.value.lower(),
+        root=cfg.data.root,
+        local_batch_size=batch_size,
+        world_size=ctx.world_size,
+        ranks=[ctx.rank],
+        base_seed=cfg.data.seed,
+        train=True,
+        packed=False,
+        channels_last=True,
+        shuffle=True,
+        augment=augment,
+        device=device,
+    )
 
 
 def _append_result(

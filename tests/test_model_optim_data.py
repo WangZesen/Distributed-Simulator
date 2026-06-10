@@ -23,7 +23,12 @@ from distributed_simulator.data import (
     deterministic_worker_indices,
     worker_indices_from_order,
 )
-from distributed_simulator.model import ModelName, get_model
+from distributed_simulator.model import (
+    ModelName,
+    get_model,
+    get_packed_model,
+    packed_parameter_view,
+)
 from distributed_simulator.optim import get_param_groups, parameter_decay_mask
 
 
@@ -37,13 +42,31 @@ def test_wide_resnet_forward_shape() -> None:
     model = get_model(ModelName.WRN_16_1, num_classes=10)
     model.eval()
     with torch.no_grad():
-        outputs = model(torch.randn(2, 3, 32, 32))
+        outputs = model(torch.randn(2, 3, 32, 32).contiguous(memory_format=torch.channels_last))
     assert outputs.shape == (2, 10)
 
 
 def test_wide_resnet_has_no_dropout_modules() -> None:
     model = get_model(ModelName.WRN_16_1, num_classes=10)
     assert not any(isinstance(module, nn.Dropout) for module in model.modules())
+
+
+def test_packed_model_initializes_identically_with_isolated_lazy_storage() -> None:
+    model = get_packed_model(ModelName.LINEAR, num_classes=3, num_models=4)
+    assert model._parameter_storage is None
+
+    for parameter in model.parameters():
+        local_parameters = packed_parameter_view(parameter, 4)
+        assert torch.equal(local_parameters, local_parameters[0].expand_as(local_parameters))
+
+    storage = model.parameter_storage
+    parameter_ptrs = {parameter.untyped_storage().data_ptr() for parameter in model.parameters()}
+    assert storage.untyped_storage().data_ptr() not in parameter_ptrs
+
+    storage.zero_()
+    assert any(torch.count_nonzero(parameter) for parameter in model.parameters())
+    model.sync_parameters_from_storage_()
+    assert all(not torch.count_nonzero(parameter) for parameter in model.parameters())
 
 
 def test_weight_decay_excludes_bias_and_batch_norm_parameters() -> None:
@@ -156,7 +179,6 @@ def test_in_memory_cifar_loads_full_split_to_target_device(monkeypatch) -> None:
         root="unused",
         train=True,
         device=torch.device("cpu"),
-        download=False,
     )
 
     assert loader.images.device.type == "cpu"
@@ -220,7 +242,6 @@ def test_batched_cifar_augmentation_matches_per_worker_path(monkeypatch) -> None
         root="unused",
         train=True,
         device=torch.device("cpu"),
-        download=False,
     )
 
     multi_images, multi_labels = loader.batch_for_workers(
