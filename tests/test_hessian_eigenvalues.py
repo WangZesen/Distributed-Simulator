@@ -222,6 +222,50 @@ def test_evaluation_batch_can_use_augmented_cifar_data(monkeypatch, tmp_path) ->
     assert not torch.equal(clean_images, augmented_images)
 
 
+def test_evaluation_batch_shuffles_with_fixed_data_seed(monkeypatch, tmp_path) -> None:
+    class FakeCifar:
+        def __init__(self, *args, device: torch.device, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+            self.images = torch.arange(6 * 3 * 32 * 32, dtype=torch.float32, device=device).view(
+                6,
+                3,
+                32,
+                32,
+            )
+            self.labels = torch.arange(6, device=device)
+            self.mean = torch.zeros(1, 3, 1, 1, device=device)
+            self.std = torch.ones(1, 3, 1, 1, device=device)
+
+    monkeypatch.setattr(eval_module, "InMemoryCifar", FakeCifar)
+    cfg = SimulationConfig(
+        virtual_workers=1,
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.WRN_16_1),
+        data=DataConfig(
+            dataset=DatasetName.CIFAR10,
+            batch_size=2,
+            num_classes=10,
+            download=False,
+            seed=17,
+        ),
+        logging=LoggingConfig(root=tmp_path / "logs"),
+    )
+
+    _, labels = _evaluation_batch(
+        cfg,
+        torch.device("cpu"),
+        ProcessContext(),
+        data_fraction=0.5,
+        augment=False,
+    )
+
+    generator = torch.Generator(device="cpu").manual_seed(cfg.data.seed)
+    expected = torch.randperm(6, generator=generator)[:3]
+    assert torch.equal(labels, expected)
+    assert not torch.equal(labels, torch.arange(3))
+
+
 def test_eval_hessian_eigenvalues_torchrun_two_processes(tmp_path) -> None:
     run_dir = _write_linear_run(tmp_path)
 

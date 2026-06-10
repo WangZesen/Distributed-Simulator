@@ -348,6 +348,12 @@ def _evaluation_batch(
         mean = dataset.mean
         std = dataset.std
 
+    generator = torch.Generator(device=device)
+    generator.manual_seed(cfg.data.seed)
+    order = torch.randperm(images.size(0), generator=generator, device=device)
+    images = images.index_select(0, order)
+    labels = labels.index_select(0, order)
+
     selected = int(images.size(0) * data_fraction)
     if selected < 1:
         raise ValueError("--data-fraction selects no samples")
