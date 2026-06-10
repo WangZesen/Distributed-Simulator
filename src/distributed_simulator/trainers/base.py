@@ -28,9 +28,6 @@ from distributed_simulator.optim import NORM_MODULES, parameter_decay_mask
 from distributed_simulator.parameters import average_distance_to_consensus
 from distributed_simulator.scheduler import lr_factor
 
-_FOREACH_ADD = "_foreach_add"
-_FOREACH_ADD_INPLACE = "_foreach_add_"
-_FOREACH_MUL_INPLACE = "_foreach_mul_"
 _EVALUATION_INTERVAL_EPOCHS = 5
 
 
@@ -141,11 +138,7 @@ class BaseTrainer:
         self.param_layout: tuple[PackedParameterLayout, ...] = ()
         self.decay_parameters: list[torch.Tensor] = []
         self.no_decay_parameters: list[torch.Tensor] = []
-        self.active_decay_parameters: list[torch.Tensor] = []
-        self.active_decay_gradients: list[torch.Tensor] = []
-        self.active_no_decay_parameters: list[torch.Tensor] = []
-        self.active_no_decay_gradients: list[torch.Tensor] = []
-        self.momentum_buffers: dict[int, torch.Tensor] = {}
+        self.optimizer: torch.optim.SGD | None = None
         self.accumulated_gamma = 0.0
         self._adaptive_max_lr: float | None = None
 
@@ -164,89 +157,15 @@ class BaseTrainer:
                 batch_targets.flatten(),
             )
         loss.backward()
-        self._refresh_optimizer_gradients()
         return loss.detach().float()
 
     @torch.no_grad()
     def _apply_optimizer_update(self, lr: float) -> None:
-        assert self.model is not None
-        weight_decay = self.cfg.optimizer.weight_decay
-        momentum = self.cfg.optimizer.momentum
-        if momentum:
-            self._apply_momentum_sgd_update(lr=lr, weight_decay=weight_decay, momentum=momentum)
-            self.model.sync_storage_from_parameters_()
-            return
-        if self.active_decay_parameters:
-            _foreach_add_(
-                self.active_decay_parameters,
-                self.active_decay_parameters,
-                alpha=-lr * weight_decay,
-            )
-            _foreach_add_(
-                self.active_decay_parameters,
-                self.active_decay_gradients,
-                alpha=-lr,
-            )
-        if self.active_no_decay_parameters:
-            _foreach_add_(
-                self.active_no_decay_parameters,
-                self.active_no_decay_gradients,
-                alpha=-lr,
-            )
+        assert self.model is not None and self.optimizer is not None
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        self.optimizer.step()
         self.model.sync_storage_from_parameters_()
-
-    def _apply_momentum_sgd_update(
-        self,
-        lr: float,
-        weight_decay: float,
-        momentum: float,
-    ) -> None:
-        if self.active_decay_parameters:
-            updates = self.active_decay_gradients
-            if weight_decay:
-                updates = _foreach_add(
-                    self.active_decay_gradients,
-                    self.active_decay_parameters,
-                    alpha=weight_decay,
-                )
-            buffers = self._momentum_buffers(
-                self.active_decay_parameters,
-                updates,
-                momentum=momentum,
-            )
-            _foreach_add_(self.active_decay_parameters, buffers, alpha=-lr)
-
-        if self.active_no_decay_parameters:
-            buffers = self._momentum_buffers(
-                self.active_no_decay_parameters,
-                self.active_no_decay_gradients,
-                momentum=momentum,
-            )
-            _foreach_add_(self.active_no_decay_parameters, buffers, alpha=-lr)
-
-    def _momentum_buffers(
-        self,
-        parameters: list[torch.Tensor],
-        updates: list[torch.Tensor],
-        momentum: float,
-    ) -> list[torch.Tensor]:
-        buffers = []
-        existing_buffers = []
-        existing_updates = []
-        for parameter, update in zip(parameters, updates, strict=True):
-            buffer = self.momentum_buffers.get(id(parameter))
-            if buffer is None:
-                buffer = update.detach().clone(memory_format=torch.preserve_format)
-                self.momentum_buffers[id(parameter)] = buffer
-            else:
-                existing_buffers.append(buffer)
-                existing_updates.append(update)
-            buffers.append(buffer)
-
-        if existing_buffers:
-            _foreach_mul_(existing_buffers, momentum)
-            _foreach_add_(existing_buffers, existing_updates, alpha=1.0)
-        return buffers
 
     def _batches_per_epoch(self) -> int:
         if isinstance(self.dataset, PackedDataLoader):
@@ -584,13 +503,17 @@ class BaseTrainer:
                 self.decay_parameters.append(parameter)
             else:
                 self.no_decay_parameters.append(parameter)
-
-    def _refresh_optimizer_gradients(self) -> None:
-        self.active_decay_parameters, self.active_decay_gradients = _parameters_with_gradients(
-            self.decay_parameters
-        )
-        self.active_no_decay_parameters, self.active_no_decay_gradients = (
-            _parameters_with_gradients(self.no_decay_parameters)
+        self.optimizer = torch.optim.SGD(
+            [
+                {
+                    "params": self.decay_parameters,
+                    "weight_decay": self.cfg.optimizer.weight_decay,
+                },
+                {"params": self.no_decay_parameters, "weight_decay": 0.0},
+            ],
+            lr=self.cfg.optimizer.lr,
+            momentum=self.cfg.optimizer.momentum,
+            foreach=True,
         )
 
     def _non_parameter_storage_buffers(self) -> dict[str, torch.Tensor]:
@@ -657,39 +580,3 @@ class BaseTrainer:
                 "virtual_workers must be divisible by launched process count; "
                 f"got {self.cfg.virtual_workers} workers and {self.ctx.world_size} processes"
             )
-
-
-def _parameters_with_gradients(
-    parameters: list[torch.Tensor],
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    active_parameters = []
-    gradients = []
-    for parameter in parameters:
-        if parameter.grad is None:
-            continue
-        active_parameters.append(parameter)
-        gradients.append(parameter.grad)
-    return active_parameters, gradients
-
-
-def _foreach_add_(
-    tensors: list[torch.Tensor],
-    others: list[torch.Tensor],
-    alpha: float,
-) -> None:
-    foreach_add = cast(Any, getattr(torch, _FOREACH_ADD_INPLACE))
-    foreach_add(tensors, others, alpha=alpha)
-
-
-def _foreach_add(
-    tensors: list[torch.Tensor],
-    others: list[torch.Tensor],
-    alpha: float,
-) -> list[torch.Tensor]:
-    foreach_add = cast(Any, getattr(torch, _FOREACH_ADD))
-    return foreach_add(tensors, others, alpha=alpha)
-
-
-def _foreach_mul_(tensors: list[torch.Tensor], scalar: float) -> None:
-    foreach_mul = cast(Any, getattr(torch, _FOREACH_MUL_INPLACE))
-    foreach_mul(tensors, scalar)

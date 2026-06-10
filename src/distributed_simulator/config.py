@@ -68,7 +68,7 @@ class RuntimeConfig(_ConfigModel):
     amp: bool = True
     amp_dtype: Literal["bf16"] = "bf16"
     compile: bool = True
-    compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
+    compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "reduce-overhead"
 
 
 class LoggingConfig(_ConfigModel):

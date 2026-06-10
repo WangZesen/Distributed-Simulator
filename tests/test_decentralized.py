@@ -301,6 +301,62 @@ def test_pairwise_adaptive_mix_does_not_mutate_before_lerp() -> None:
     assert torch.allclose(trainer._local_vectors(), expected)
 
 
+def test_decentralized_mix_uses_optimizer_synchronized_storage(monkeypatch) -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+        runtime=RuntimeConfig(amp=False),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    assert trainer.model is not None
+
+    def fail_sync() -> None:
+        raise AssertionError(
+            "mixing should use storage synchronized by the previous optimizer step"
+        )
+
+    monkeypatch.setattr(trainer.model, "sync_storage_from_parameters_", fail_sync)
+
+    trainer._mix_parameters(step=0)
+
+
+def test_pairwise_mixing_reuses_temporary_buffers() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(topology=Topology.RING),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+        runtime=RuntimeConfig(amp=False),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    peer_ptr = trainer._pairwise_peer_vectors.untyped_storage().data_ptr()
+    mixed_ptr = trainer._pairwise_mixed_vectors.untyped_storage().data_ptr()
+
+    first = trainer._finish_pairwise_topology_mix(
+        trainer._local_vectors(),
+        trainer._active_peer_by_rank(0),
+        {},
+        peer_local_indices=trainer._pairwise_exchange_plan(0).peer_local_indices,
+    )
+    second = trainer._finish_pairwise_topology_mix(
+        trainer._local_vectors(),
+        trainer._active_peer_by_rank(1),
+        {},
+        peer_local_indices=trainer._pairwise_exchange_plan(1).peer_local_indices,
+    )
+
+    assert first is trainer._pairwise_mixed_vectors
+    assert second is trainer._pairwise_mixed_vectors
+    assert trainer._pairwise_peer_vectors.untyped_storage().data_ptr() == peer_ptr
+    assert trainer._pairwise_mixed_vectors.untyped_storage().data_ptr() == mixed_ptr
+
+
 def test_ring_pairwise_peer_schedule_is_cached() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=4,
@@ -357,6 +413,13 @@ def test_remote_pairwise_exchange_metadata_is_cached(monkeypatch) -> None:
     assert torch.equal(
         remote_phase.send_local_indices_by_process[1],
         torch.tensor([0, 1]),
+    )
+    assert remote_phase.send_slices_by_process == {1: slice(0, 2)}
+    assert 1 not in trainer._pairwise_send_buffers
+    direct_send = trainer._local_vectors()[remote_phase.send_slices_by_process[1]]
+    assert (
+        direct_send.untyped_storage().data_ptr()
+        == trainer._local_vectors().untyped_storage().data_ptr()
     )
 
 
@@ -504,6 +567,8 @@ def test_sgd_update_uses_configured_momentum() -> None:
     )
     trainer = DecentralizedTrainer(cfg, ProcessContext())
     assert trainer.model is not None
+    assert isinstance(trainer.optimizer, torch.optim.SGD)
+    assert all(group["foreach"] is True for group in trainer.optimizer.param_groups)
 
     parameters = dict(trainer.model.named_parameters())
     weight = next(value for name, value in parameters.items() if name.endswith("weight"))
@@ -516,7 +581,6 @@ def test_sgd_update_uses_configured_momentum() -> None:
     weight.grad = torch.full_like(weight, 0.25)
     bias.grad = torch.full_like(bias, -0.5)
 
-    trainer._refresh_optimizer_gradients()
     trainer._apply_optimizer_update(lr=0.1)
 
     first_weight_update = torch.full_like(first_weight, 0.25).add(first_weight, alpha=0.1)
@@ -530,7 +594,6 @@ def test_sgd_update_uses_configured_momentum() -> None:
     second_bias = bias.detach().clone()
     weight.grad = torch.full_like(weight, 0.25)
     bias.grad = torch.full_like(bias, -0.5)
-    trainer._refresh_optimizer_gradients()
     trainer._apply_optimizer_update(lr=0.1)
 
     second_weight_update = torch.full_like(second_weight, 0.25).add(second_weight, alpha=0.1)

@@ -204,7 +204,6 @@ class SAMTrainer(BaseTrainer):
             segment = averaged[item.start : item.start + item.numel]
             grad_by_worker = packed_parameter_view(parameter.grad, self.local_worker_count)
             grad_by_worker.copy_(segment.expand_as(grad_by_worker))
-        self._refresh_optimizer_gradients()
 
     def _coalesced_averaged_gradient_(self) -> torch.Tensor:
         self._pack_current_gradients_(self._gradient_storage_buffer)

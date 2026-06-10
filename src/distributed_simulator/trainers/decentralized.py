@@ -30,6 +30,7 @@ class PairwiseExchangePlan:
     peer_by_rank: dict[int, int]
     peer_local_indices: torch.Tensor
     send_local_indices_by_process: dict[int, torch.Tensor]
+    send_slices_by_process: dict[int, slice]
     recv_by_process: dict[int, tuple[int, ...]]
     remote_processes: tuple[int, ...]
 
@@ -77,6 +78,12 @@ class DecentralizedTrainer(BaseTrainer):
         }
         self.pairwise_exchange_plans = self._build_pairwise_exchange_plans()
         self._init_packed_model()
+        assert self.param_storage is not None
+        self._pairwise_peer_vectors = torch.empty_like(self.param_storage)
+        self._pairwise_mixed_vectors = torch.empty_like(self.param_storage)
+        self._pairwise_send_buffers: dict[int, torch.Tensor] = {}
+        self._pairwise_recv_buffers: dict[int, torch.Tensor] = {}
+        self._init_pairwise_exchange_buffers()
         logger.info(
             "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} "
             "overlap_mixing={} backend=packed",
@@ -216,7 +223,6 @@ class DecentralizedTrainer(BaseTrainer):
         stream: torch.cuda.Stream | None,
     ) -> PendingMix:
         assert self.model is not None
-        self.model.sync_storage_from_parameters_()
         vectors = self._local_vectors()
         if self.trainer_cfg.topology == Topology.COMPLETE:
             return self._start_complete_graph_mix(vectors, gamma=gamma, stream=stream)
@@ -335,10 +341,20 @@ class DecentralizedTrainer(BaseTrainer):
         peer_local_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if peer_local_indices is not None and not remote_peer_vectors:
-            peer_vectors = local_vectors.index_select(0, peer_local_indices)
-            return torch.add(local_vectors, peer_vectors).mul_(0.5)
+            torch.index_select(
+                local_vectors,
+                0,
+                peer_local_indices,
+                out=self._pairwise_peer_vectors,
+            )
+            torch.add(
+                local_vectors,
+                self._pairwise_peer_vectors,
+                out=self._pairwise_mixed_vectors,
+            )
+            return self._pairwise_mixed_vectors.mul_(0.5)
 
-        peer_vectors = torch.empty_like(local_vectors)
+        peer_vectors = self._pairwise_peer_vectors
 
         for local_index, rank in enumerate(self.owned_ranks):
             peer = peer_by_rank[rank]
@@ -348,7 +364,8 @@ class DecentralizedTrainer(BaseTrainer):
                 peer_vectors[local_index].copy_(local_vectors[self.local_index_by_rank[peer]])
             else:
                 peer_vectors[local_index].copy_(remote_peer_vectors[peer])
-        return torch.add(local_vectors, peer_vectors).mul_(0.5)
+        torch.add(local_vectors, peer_vectors, out=self._pairwise_mixed_vectors)
+        return self._pairwise_mixed_vectors.mul_(0.5)
 
     def _mixing_gamma(self, step: int, lr: float) -> float:
         mix_cfg = self.trainer_cfg.mix
@@ -383,7 +400,7 @@ class DecentralizedTrainer(BaseTrainer):
     ) -> torch.Tensor:
         if gamma == 1.0:
             return mixed_vectors
-        return local_vectors.lerp(mixed_vectors, gamma)
+        return mixed_vectors.lerp_(local_vectors, 1.0 - gamma)
 
     @torch.no_grad()
     def _start_remote_peer_exchange(
@@ -401,16 +418,16 @@ class DecentralizedTrainer(BaseTrainer):
             send_indices = plan.send_local_indices_by_process.get(process)
             recv_ranks = plan.recv_by_process.get(process, ())
             if send_indices is not None:
-                send_tensor = local_vectors.index_select(0, send_indices)
+                send_slice = plan.send_slices_by_process.get(process)
+                if send_slice is not None:
+                    send_tensor = local_vectors[send_slice]
+                else:
+                    send_tensor = self._pairwise_send_buffers[process][: send_indices.numel()]
+                    torch.index_select(local_vectors, 0, send_indices, out=send_tensor)
                 send_tensors.append(send_tensor)
                 ops.append(dist.P2POp(dist.isend, send_tensor, process))
             if recv_ranks:
-                recv_tensor = torch.empty(
-                    len(recv_ranks),
-                    local_vectors.size(1),
-                    dtype=local_vectors.dtype,
-                    device=local_vectors.device,
-                )
+                recv_tensor = self._pairwise_recv_buffers[process][: len(recv_ranks)]
                 recv_tensors[process] = recv_tensor
                 ops.append(dist.P2POp(dist.irecv, recv_tensor, process))
 
@@ -487,6 +504,11 @@ class DecentralizedTrainer(BaseTrainer):
                 )
                 for process, items in send_by_process.items()
             }
+            send_slices = {
+                process: send_slice
+                for process, indices in send_indices.items()
+                if (send_slice := _contiguous_row_slice(indices)) is not None
+            }
             recv_ranks = {
                 process: tuple(sorted(ranks)) for process, ranks in recv_by_process.items()
             }
@@ -500,11 +522,39 @@ class DecentralizedTrainer(BaseTrainer):
                         device=self.device,
                     ),
                     send_local_indices_by_process=send_indices,
+                    send_slices_by_process=send_slices,
                     recv_by_process=recv_ranks,
                     remote_processes=remote_processes,
                 )
             )
         return tuple(plans)
+
+    def _init_pairwise_exchange_buffers(self) -> None:
+        assert self.param_storage is not None
+        width = self.param_storage.size(1)
+        max_send_rows: dict[int, int] = {}
+        max_recv_rows: dict[int, int] = {}
+        for plan in self.pairwise_exchange_plans:
+            for process, indices in plan.send_local_indices_by_process.items():
+                if process in plan.send_slices_by_process:
+                    continue
+                max_send_rows[process] = max(max_send_rows.get(process, 0), indices.numel())
+            for process, ranks in plan.recv_by_process.items():
+                max_recv_rows[process] = max(max_recv_rows.get(process, 0), len(ranks))
+        for process, rows in max_send_rows.items():
+            self._pairwise_send_buffers[process] = torch.empty(
+                rows,
+                width,
+                dtype=self.param_storage.dtype,
+                device=self.param_storage.device,
+            )
+        for process, rows in max_recv_rows.items():
+            self._pairwise_recv_buffers[process] = torch.empty(
+                rows,
+                width,
+                dtype=self.param_storage.dtype,
+                device=self.param_storage.device,
+            )
 
     def _use_cuda_mixing_overlap(self) -> bool:
         return (
@@ -512,3 +562,13 @@ class DecentralizedTrainer(BaseTrainer):
             and self.device.type == "cuda"
             and torch.cuda.is_available()
         )
+
+
+def _contiguous_row_slice(indices: torch.Tensor) -> slice | None:
+    rows = indices.tolist()
+    if not rows:
+        return None
+    start = rows[0]
+    if rows != list(range(start, start + len(rows))):
+        return None
+    return slice(start, start + len(rows))

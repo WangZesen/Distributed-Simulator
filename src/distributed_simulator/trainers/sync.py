@@ -143,7 +143,6 @@ class SyncTrainer(BaseTrainer):
             segment = averaged[item.start : item.start + item.numel]
             grad_by_worker = packed_parameter_view(parameter.grad, self.local_worker_count)
             grad_by_worker.copy_(segment.expand_as(grad_by_worker))
-        self._refresh_optimizer_gradients()
 
     def _coalesced_averaged_gradient_(self) -> torch.Tensor:
         assert self.model is not None
