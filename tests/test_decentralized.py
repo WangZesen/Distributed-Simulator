@@ -751,9 +751,11 @@ def test_bf16_amp_packed_cpu_smoke() -> None:
 
 def test_torch_compile_forward_path_is_used(monkeypatch) -> None:
     compile_calls = []
+    compile_targets = []
 
     def fake_compile(function, **kwargs):  # noqa: ANN001
         compile_calls.append(kwargs)
+        compile_targets.append(function)
 
         def compiled(inputs: torch.Tensor) -> torch.Tensor:
             return function(inputs)
@@ -770,10 +772,29 @@ def test_torch_compile_forward_path_is_used(monkeypatch) -> None:
         data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
         runtime=RuntimeConfig(amp=False, compile=True, compile_mode="reduce-overhead"),
     )
-    metrics = DecentralizedTrainer(cfg, ProcessContext()).train()
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    metrics = trainer.train()
 
-    assert compile_calls == [{"mode": "reduce-overhead", "fullgraph": False}]
+    assert compile_calls == [{"mode": "reduce-overhead"}]
+    assert compile_targets == [trainer.model]
     assert torch.isfinite(torch.tensor(metrics.loss))
+
+
+def test_trainer_configures_cudnn_benchmark(monkeypatch) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+        runtime=RuntimeConfig(amp=False, compile=False, cudnn_benchmark=True),
+    )
+
+    DecentralizedTrainer(cfg, ProcessContext())
+
+    assert torch.backends.cudnn.benchmark is True
 
 
 def test_cuda_bf16_amp_wrn_smoke_uses_batched_autograd(monkeypatch) -> None:

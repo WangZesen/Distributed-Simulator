@@ -116,6 +116,7 @@ class BaseTrainer:
         self.trainer_cfg = trainer_cfg
         self.device = torch.device(cfg.device)
         self.ctx = ctx or ProcessContext()
+        torch.backends.cudnn.benchmark = cfg.runtime.cudnn_benchmark
         self._validate_process_layout()
 
         self.owned_ranks = self._owned_ranks()
@@ -133,7 +134,7 @@ class BaseTrainer:
         self.test_batches_per_epoch = self._test_batches_per_epoch()
         self.total_steps = self.cfg.epochs * self.batches_per_epoch
         self.model: PackedModel | None = None
-        self._model_forward: Callable[[torch.Tensor], torch.Tensor] | None = None
+        self.forward_model: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.param_storage: torch.Tensor | None = None
         self.param_layout: tuple[PackedParameterLayout, ...] = ()
         self.decay_parameters: list[torch.Tensor] = []
@@ -153,7 +154,7 @@ class BaseTrainer:
         with self._autocast_context():
             logits = self._forward_model(batch_inputs)
             loss = F.cross_entropy(
-                logits.flatten(end_dim=1).float(),
+                logits.flatten(end_dim=1),
                 batch_targets.flatten(),
             )
         loss.backward()
@@ -381,7 +382,6 @@ class BaseTrainer:
         return torch.autocast(
             device_type=self.device.type,
             dtype=torch.bfloat16,
-            cache_enabled=False,
         )
 
     def _amp_enabled(self) -> bool:
@@ -438,7 +438,7 @@ class BaseTrainer:
             ).to(self.device),
         )
         self.model.train()
-        self._model_forward = self._build_model_forward()
+        self.forward_model = self._build_forward_model()
         param_storage = self.model.parameter_storage
         self.param_storage = param_storage
         self.param_layout = parameter_storage_layout(
@@ -467,30 +467,24 @@ class BaseTrainer:
         self.param_storage.copy_(source.expand_as(self.param_storage))
         self.model.sync_parameters_from_storage_()
 
-    def _build_model_forward(self) -> Callable[[torch.Tensor], torch.Tensor]:
+    def _build_forward_model(self) -> Callable[[torch.Tensor], torch.Tensor]:
         assert self.model is not None
-
-        def forward(inputs: torch.Tensor) -> torch.Tensor:
-            assert self.model is not None
-            return self.model(inputs)
-
         if not self.cfg.runtime.compile:
-            return forward
+            return self.model
         compiled = torch.compile(
-            forward,
+            self.model,
             mode=self.cfg.runtime.compile_mode,
-            fullgraph=False,
         )
         logger.info(
-            "Rank {} enabled torch.compile for model forward with mode={}",
+            "Rank {} enabled torch.compile for model with mode={}",
             self.ctx.rank,
             self.cfg.runtime.compile_mode,
         )
         return cast(Callable[[torch.Tensor], torch.Tensor], compiled)
 
     def _forward_model(self, inputs: torch.Tensor) -> torch.Tensor:
-        assert self._model_forward is not None
-        return self._model_forward(inputs)
+        assert self.forward_model is not None
+        return self.forward_model(inputs)
 
     def _init_optimizer_parameters(self, decay_by_name: dict[str, float]) -> None:
         assert self.model is not None

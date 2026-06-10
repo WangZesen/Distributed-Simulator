@@ -315,6 +315,7 @@ def test_default_training_configuration_matches_requested_setup() -> None:
     assert cfg.runtime.amp_dtype == "bf16"
     assert cfg.runtime.compile is True
     assert cfg.runtime.compile_mode == "reduce-overhead"
+    assert cfg.runtime.cudnn_benchmark is True
     assert cfg.logging.root.as_posix() == "logs"
     assert cfg.logging.save_last_checkpoint is False
     assert cfg.optimizer.momentum == 0.9

@@ -22,6 +22,8 @@ dev = [
 [project.scripts]
 dsim-train = "distributed_simulator.cli:main"
 dsim-eval-hessian-eigenvalues = "distributed_simulator.eval_hessian_eigenvalues:main"
+dsim-profile-forward-backward = "distributed_simulator.profile_forward_backward:main"
+dsim-profile-trainer = "distributed_simulator.profile_trainers:main"
 
 [build-system]
 requires = ["hatchling"]
