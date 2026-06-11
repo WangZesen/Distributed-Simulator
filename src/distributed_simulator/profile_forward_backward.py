@@ -28,6 +28,7 @@ from distributed_simulator.distributed import (
     resolve_process_device,
 )
 from distributed_simulator.model import ModelName, get_packed_model
+from distributed_simulator.precision import configure_tf32
 from distributed_simulator.trainers.base import BaseTrainer
 
 _IMAGE_SHAPE = (3, 32, 32)
@@ -328,6 +329,7 @@ def profile_forward_backward(
         num_classes=num_classes,
     )
     torch.backends.cudnn.benchmark = cfg.runtime.cudnn_benchmark
+    configure_tf32(cfg.runtime, device)
     amp_enabled = cfg.runtime.amp and device.type in {"cpu", "cuda"}
 
     raw_model = cast(

@@ -34,10 +34,12 @@ class SyncTrainer(BaseTrainer):
             device=self.param_storage.device,
         )
         logger.info(
-            "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} backend=packed-sync",
+            "Rank {} runtime: amp={} dtype={} tf32={} compile={} compile_mode={} "
+            "backend=packed-sync",
             self.ctx.rank,
             self._amp_enabled(),
             self.cfg.runtime.amp_dtype,
+            self.tf32_enabled,
             self.cfg.runtime.compile,
             self.cfg.runtime.compile_mode,
         )

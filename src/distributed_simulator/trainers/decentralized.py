@@ -85,11 +85,12 @@ class DecentralizedTrainer(BaseTrainer):
         self._pairwise_recv_buffers: dict[int, torch.Tensor] = {}
         self._init_pairwise_exchange_buffers()
         logger.info(
-            "Rank {} runtime: amp={} dtype={} compile={} compile_mode={} "
+            "Rank {} runtime: amp={} dtype={} tf32={} compile={} compile_mode={} "
             "overlap_mixing={} backend=packed",
             self.ctx.rank,
             self._amp_enabled(),
             self.cfg.runtime.amp_dtype,
+            self.tf32_enabled,
             self.cfg.runtime.compile,
             self.cfg.runtime.compile_mode,
             self.trainer_cfg.overlap_mixing,

@@ -1,0 +1,6 @@
+virtual_workers = 64
+[optimizer]
+lr = 0.4
+[trainer]
+name = "decentralized"
+topology = "exp"

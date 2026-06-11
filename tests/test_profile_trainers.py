@@ -4,6 +4,7 @@ from distributed_simulator.config import (
     DataConfig,
     DecentralizedTrainerConfig,
     ModelConfig,
+    OptimizerConfig,
     RuntimeConfig,
     SAMTrainerConfig,
     SimulationConfig,
@@ -14,6 +15,49 @@ from distributed_simulator.distributed import ProcessContext
 from distributed_simulator.model import ModelName
 from distributed_simulator.profile_trainers import profile_trainer
 from distributed_simulator.trainers import DecentralizedTrainer, SAMTrainer, SyncTrainer
+
+
+@pytest.mark.parametrize(
+    ("trainer_config", "trainer_type"),
+    [
+        (SyncTrainerConfig(), SyncTrainer),
+        (SAMTrainerConfig(), SAMTrainer),
+        (DecentralizedTrainerConfig(), DecentralizedTrainer),
+    ],
+)
+def test_all_trainers_use_fused_optimizer_by_default(trainer_config, trainer_type) -> None:
+    cfg = SimulationConfig(
+        virtual_workers=2,
+        epochs=0,
+        device="cpu",
+        trainer=trainer_config,
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+        runtime=RuntimeConfig(amp=False, compile=False),
+    )
+
+    trainer = trainer_type(cfg, ProcessContext())
+
+    assert trainer.optimizer is not None
+    assert trainer.optimizer.defaults["fused"] is True
+
+
+def test_fused_optimizer_can_be_disabled() -> None:
+    cfg = SimulationConfig(
+        virtual_workers=2,
+        epochs=0,
+        device="cpu",
+        trainer=SyncTrainerConfig(),
+        model=ModelConfig(name=ModelName.LINEAR),
+        optimizer=OptimizerConfig(fused=False),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=2, num_classes=2),
+        runtime=RuntimeConfig(amp=False, compile=False),
+    )
+
+    trainer = SyncTrainer(cfg, ProcessContext())
+
+    assert trainer.optimizer is not None
+    assert trainer.optimizer.defaults["fused"] is False
 
 
 @pytest.mark.parametrize(

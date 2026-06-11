@@ -1,0 +1,4 @@
+[logging]
+save_last_checkpoint = true
+[runtime]
+amp = true

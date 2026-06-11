@@ -1,0 +1,7 @@
+[trainer]
+name = "decentralized"
+[trainer.mix]
+name = "adaptive"
+p = 3.0
+max_gamma = 1.0
+min_gamma = 0.0

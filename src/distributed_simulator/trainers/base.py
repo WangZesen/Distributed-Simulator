@@ -26,6 +26,7 @@ from distributed_simulator.model import (
 )
 from distributed_simulator.optim import NORM_MODULES, parameter_decay_mask
 from distributed_simulator.parameters import average_distance_to_consensus
+from distributed_simulator.precision import configure_tf32
 from distributed_simulator.scheduler import lr_factor
 
 _EVALUATION_INTERVAL_EPOCHS = 5
@@ -117,6 +118,7 @@ class BaseTrainer:
         self.device = torch.device(cfg.device)
         self.ctx = ctx or ProcessContext()
         torch.backends.cudnn.benchmark = cfg.runtime.cudnn_benchmark
+        self.tf32_enabled = configure_tf32(cfg.runtime, self.device)
         self._validate_process_layout()
 
         self.owned_ranks = self._owned_ranks()
@@ -153,12 +155,12 @@ class BaseTrainer:
         self.model.zero_grad(set_to_none=True)
         with self._autocast_context():
             logits = self._forward_model(batch_inputs)
-            loss = F.cross_entropy(
+            reported_loss = F.cross_entropy(
                 logits.flatten(end_dim=1),
                 batch_targets.flatten(),
             )
-        loss.backward()
-        return loss.detach().float()
+        (reported_loss * self.local_worker_count).backward()
+        return reported_loss.detach().float()
 
     @torch.no_grad()
     def _apply_optimizer_update(self, lr: float) -> None:
@@ -507,7 +509,7 @@ class BaseTrainer:
             ],
             lr=self.cfg.optimizer.lr,
             momentum=self.cfg.optimizer.momentum,
-            foreach=True,
+            fused=self.cfg.optimizer.fused,
         )
 
     def _non_parameter_storage_buffers(self) -> dict[str, torch.Tensor]:

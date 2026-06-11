@@ -313,6 +313,7 @@ def test_default_training_configuration_matches_requested_setup() -> None:
     assert cfg.data.eval_batch_size == 10000
     assert cfg.runtime.amp is True
     assert cfg.runtime.amp_dtype == "bf16"
+    assert cfg.runtime.tf32 is True
     assert cfg.runtime.compile is True
     assert cfg.runtime.compile_mode == "reduce-overhead"
     assert cfg.runtime.cudnn_benchmark is True
@@ -320,6 +321,7 @@ def test_default_training_configuration_matches_requested_setup() -> None:
     assert cfg.logging.save_last_checkpoint is False
     assert cfg.optimizer.momentum == 0.9
     assert cfg.optimizer.weight_decay == 5e-4
+    assert cfg.optimizer.fused is True
     assert isinstance(cfg.trainer, DecentralizedTrainerConfig)
     assert cfg.trainer.topology == Topology.RING
     assert cfg.trainer.overlap_mixing is True

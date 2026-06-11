@@ -64,3 +64,10 @@ This profiler uses the same random packed batch for both cases and enables
 
 All trainers enable `torch.backends.cudnn.benchmark` by default. Set
 `runtime.cudnn_benchmark = false` when deterministic cuDNN algorithm selection is required.
+
+CUDA training uses BF16 AMP when `runtime.amp = true`. When AMP is disabled, CUDA training
+uses TF32 by default for matrix multiplications and cuDNN operations. Set
+`runtime.tf32 = false` to retain full FP32 precision.
+
+All trainers use fused SGD by default. Set `optimizer.fused = false` to use the standard
+optimizer implementation.

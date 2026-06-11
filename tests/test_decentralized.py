@@ -136,6 +136,53 @@ def test_decentralized_trainer_uses_packed_storage() -> None:
     assert trainer.param_layout
 
 
+def test_local_gradients_match_standalone_worker_mean_gradients() -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=4,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(dataset=DatasetName.SYNTHETIC, batch_size=3, num_classes=2),
+        runtime=RuntimeConfig(amp=False, compile=False),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    assert trainer.model is not None
+    inputs, targets = trainer._next_batch()
+
+    reported_loss = trainer._compute_local_gradients((inputs, targets))
+
+    weight = next(
+        parameter for name, parameter in trainer.model.named_parameters() if name.endswith("weight")
+    )
+    bias = next(
+        parameter for name, parameter in trainer.model.named_parameters() if name.endswith("bias")
+    )
+    assert weight.grad is not None and bias.grad is not None
+    for worker in range(trainer.local_worker_count):
+        local_weight = weight[worker].detach().clone().requires_grad_()
+        local_bias = bias[worker].detach().clone().requires_grad_()
+        local_logits = torch.nn.functional.linear(
+            inputs[:, worker].flatten(start_dim=1),
+            local_weight,
+            local_bias,
+        )
+        local_loss = torch.nn.functional.cross_entropy(local_logits, targets[:, worker])
+        local_loss.backward()
+
+        assert local_weight.grad is not None and local_bias.grad is not None
+        assert torch.allclose(weight.grad[worker], local_weight.grad)
+        assert torch.allclose(bias.grad[worker], local_bias.grad)
+
+    with torch.no_grad():
+        logits = trainer.model(inputs)
+        expected_reported_loss = torch.nn.functional.cross_entropy(
+            logits.flatten(end_dim=1),
+            targets.flatten(),
+        )
+    assert torch.allclose(reported_loss, expected_reported_loss)
+
+
 def test_decentralized_initializes_all_replicas_from_rank_zero(monkeypatch) -> None:
     cfg = DecentralizedConfig(
         virtual_workers=4,
@@ -568,7 +615,7 @@ def test_sgd_update_uses_configured_momentum() -> None:
     trainer = DecentralizedTrainer(cfg, ProcessContext())
     assert trainer.model is not None
     assert isinstance(trainer.optimizer, torch.optim.SGD)
-    assert all(group["foreach"] is True for group in trainer.optimizer.param_groups)
+    assert all(group["fused"] is True for group in trainer.optimizer.param_groups)
 
     parameters = dict(trainer.model.named_parameters())
     weight = next(value for name, value in parameters.items() if name.endswith("weight"))

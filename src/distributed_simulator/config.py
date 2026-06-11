@@ -31,6 +31,7 @@ class OptimizerConfig(_ConfigModel):
     lr: float = Field(default=0.1, ge=0.0)
     momentum: float = Field(default=0.9, ge=0.0)
     weight_decay: float = Field(default=5e-4, ge=0.0)
+    fused: bool = True
 
 
 class ModelConfig(_ConfigModel):
@@ -67,6 +68,7 @@ class DataConfig(_ConfigModel):
 class RuntimeConfig(_ConfigModel):
     amp: bool = True
     amp_dtype: Literal["bf16"] = "bf16"
+    tf32: bool = True
     compile: bool = True
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "reduce-overhead"
     cudnn_benchmark: bool = True
