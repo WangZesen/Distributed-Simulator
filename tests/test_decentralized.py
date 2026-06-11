@@ -982,6 +982,37 @@ def test_evaluation_calibrates_batchnorm_before_testing(monkeypatch) -> None:
     assert calibrated_epochs == [1]
 
 
+def test_evaluation_retains_calibrated_buffers_for_checkpointing(monkeypatch) -> None:
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=1,
+        device="cpu",
+        model=ModelConfig(name=ModelName.LINEAR),
+        data=DataConfig(
+            dataset=DatasetName.SYNTHETIC,
+            batch_size=2,
+            eval_batch_size=8,
+            num_classes=2,
+        ),
+        runtime=RuntimeConfig(amp=False),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    assert trainer.model is not None
+    trainer.model.register_buffer("calibrated_for_checkpoint", torch.tensor(0.0))
+
+    def calibrate_for_checkpoint(epoch: int) -> None:
+        del epoch
+        assert trainer.model is not None
+        trainer.model.calibrated_for_checkpoint.fill_(7.0)
+
+    monkeypatch.setattr(trainer, "_calibrate_average_model_batchnorm_", calibrate_for_checkpoint)
+
+    trainer._evaluate_epoch(epoch=1, train_loss=0.0, lr=0.0)
+
+    assert trainer.model.calibrated_for_checkpoint.item() == 7.0
+
+
 def test_eval_batch_size_is_capped_to_worker_shard_size() -> None:
     cfg = DecentralizedConfig(
         virtual_workers=2,

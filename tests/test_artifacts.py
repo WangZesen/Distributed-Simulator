@@ -3,6 +3,7 @@ import tomllib
 from datetime import datetime
 
 import torch
+import torch.nn as nn
 from packed_resnet import PackedDataLoader, WideResNet
 
 import distributed_simulator.trainers.base as trainer_base
@@ -27,6 +28,26 @@ from distributed_simulator.data import DatasetName
 from distributed_simulator.distributed import ProcessContext
 from distributed_simulator.model import ModelName
 from distributed_simulator.trainers import DecentralizedTrainer, EpochMetrics, TrainMetrics
+
+
+def _fake_packed_cifar_loader(*args, **kwargs) -> PackedDataLoader:  # noqa: ANN002
+    del args
+    device = kwargs["device"]
+    return PackedDataLoader(
+        torch.randn(16, 3, 32, 32, device=device),
+        torch.arange(16, device=device) % 10,
+        local_batch_size=kwargs["local_batch_size"],
+        world_size=kwargs["world_size"],
+        ranks=kwargs["ranks"],
+        base_seed=kwargs["base_seed"],
+        packed=True,
+        channels_last=True,
+        shuffle=kwargs["shuffle"],
+        augment=False,
+        normalize=False,
+        sampler_drop_last=kwargs["sampler_drop_last"],
+        drop_last=kwargs["drop_last"],
+    )
 
 
 def test_run_id_prefers_slurm_job_id(monkeypatch) -> None:
@@ -120,35 +141,7 @@ def test_decentralized_checkpoints_are_external_wide_resnet_state_dicts(
     monkeypatch,
     tmp_path,
 ) -> None:
-    class FakeCifar:
-        def __init__(self, *args, device: torch.device, **kwargs) -> None:  # noqa: ANN002, ANN003
-            del args, kwargs
-            self.images = torch.randn(16, 3, 32, 32, device=device)
-            self.labels = torch.arange(16, device=device) % 10
-
-        def __len__(self) -> int:
-            return self.images.size(0)
-
-    def fake_loader(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
-        del args
-        device = kwargs["device"]
-        return PackedDataLoader(
-            torch.randn(16, 3, 32, 32, device=device),
-            torch.arange(16, device=device) % 10,
-            local_batch_size=kwargs["local_batch_size"],
-            world_size=kwargs["world_size"],
-            ranks=kwargs["ranks"],
-            base_seed=kwargs["base_seed"],
-            packed=True,
-            channels_last=True,
-            shuffle=kwargs["shuffle"],
-            augment=False,
-            normalize=False,
-            sampler_drop_last=kwargs["sampler_drop_last"],
-            drop_last=kwargs["drop_last"],
-        )
-
-    monkeypatch.setattr(trainer_base, "create_dataloader", fake_loader)
+    monkeypatch.setattr(trainer_base, "create_dataloader", _fake_packed_cifar_loader)
     cfg = DecentralizedConfig(
         virtual_workers=2,
         trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
@@ -172,3 +165,44 @@ def test_decentralized_checkpoints_are_external_wide_resnet_state_dicts(
     for path in checkpoint_paths:
         state = torch.load(path, map_location="cpu", weights_only=True)
         model.load_state_dict(state)
+
+
+def test_decentralized_checkpoints_retain_calibrated_global_batchnorm_buffers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(trainer_base, "create_dataloader", _fake_packed_cifar_loader)
+    cfg = DecentralizedConfig(
+        virtual_workers=2,
+        trainer=DecentralizedTrainerConfig(topology=Topology.COMPLETE),
+        epochs=0,
+        device="cpu",
+        model=ModelConfig(name=ModelName.WRN_16_1),
+        data=DataConfig(dataset=DatasetName.CIFAR10, batch_size=2, eval_batch_size=8),
+        logging=LoggingConfig(root=tmp_path / "logs", save_last_checkpoint=True),
+    )
+    trainer = DecentralizedTrainer(cfg, ProcessContext())
+    assert trainer.model is not None
+
+    def set_calibrated_buffers(epoch: int) -> None:
+        del epoch
+        assert trainer.model is not None
+        for module in trainer.model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                assert module.running_mean is not None
+                assert module.running_var is not None
+                module.running_mean.fill_(7.0)
+                module.running_var.fill_(3.0)
+
+    monkeypatch.setattr(trainer, "_calibrate_average_model_batchnorm_", set_calibrated_buffers)
+
+    trainer._evaluate_epoch(epoch=0, train_loss=0.0, lr=0.0)
+    save_last_checkpoints(trainer, tmp_path / "checkpoints")
+
+    for path in sorted((tmp_path / "checkpoints").glob("*.pth")):
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        for name, value in state.items():
+            if name.endswith("running_mean"):
+                assert torch.equal(value, torch.full_like(value, 7.0))
+            elif name.endswith("running_var"):
+                assert torch.equal(value, torch.full_like(value, 3.0))

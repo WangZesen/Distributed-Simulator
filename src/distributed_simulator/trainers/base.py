@@ -285,7 +285,6 @@ class BaseTrainer:
         global_vector, d2c = self._global_average_vector_and_d2c()
         was_training = self.model.training
         saved_vectors = self.param_storage.detach().clone()
-        saved_buffers = self._non_parameter_storage_buffers()
         self.model.eval()
         loss_sum = torch.zeros((), device=self.device)
         correct = torch.zeros((), device=self.device)
@@ -314,7 +313,8 @@ class BaseTrainer:
         finally:
             self.param_storage.copy_(saved_vectors)
             self.model.sync_parameters_from_storage_()
-            self._restore_buffers_(saved_buffers)
+            # Match the reference: restore local parameters but retain the
+            # calibrated global-model BatchNorm buffers for checkpointing.
             self.model.train(was_training)
 
         totals = torch.stack((loss_sum, correct, examples))
@@ -511,20 +511,6 @@ class BaseTrainer:
             momentum=self.cfg.optimizer.momentum,
             fused=self.cfg.optimizer.fused,
         )
-
-    def _non_parameter_storage_buffers(self) -> dict[str, torch.Tensor]:
-        assert self.model is not None
-        return {
-            name: buffer.detach().clone()
-            for name, buffer in self.model.named_buffers()
-            if name != "parameter_storage"
-        }
-
-    def _restore_buffers_(self, buffers: dict[str, torch.Tensor]) -> None:
-        assert self.model is not None
-        current = dict(self.model.named_buffers())
-        for name, value in buffers.items():
-            current[name].copy_(value)
 
     @torch.no_grad()
     def _average_packed_buffers_(self) -> None:
