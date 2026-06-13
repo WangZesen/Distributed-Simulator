@@ -19,6 +19,7 @@ from distributed_simulator.distributed import (
     init_process_context,
     resolve_process_device,
 )
+from distributed_simulator.logging import LOG_FORMAT
 from distributed_simulator.trainers import DecentralizedTrainer, SAMTrainer, SyncTrainer
 from distributed_simulator.trainers.base import BaseTrainer
 
@@ -259,7 +260,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     _validate_args(args)
     logger.remove()
-    logger.add(sys.stderr, level=args.log_level.upper())
+    logger.add(sys.stderr, level=args.log_level.upper(), format=LOG_FORMAT)
     cfg = config_from_args(args)
     device = resolve_process_device(cfg.device)
     ctx = init_process_context(device)

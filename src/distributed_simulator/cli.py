@@ -26,6 +26,7 @@ from distributed_simulator.distributed import (
     init_process_context,
     resolve_process_device,
 )
+from distributed_simulator.logging import LOG_FORMAT
 from distributed_simulator.model import ModelName
 from distributed_simulator.trainers import DecentralizedTrainer, SAMTrainer, SyncTrainer
 
@@ -60,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def configure_logging(level: str) -> None:
     logger.remove()
-    logger.add(sys.stderr, level=level.upper(), enqueue=True)
+    logger.add(sys.stderr, level=level.upper(), format=LOG_FORMAT, enqueue=True)
 
 
 def config_from_args(args: argparse.Namespace) -> SimulationConfig:
@@ -124,7 +125,12 @@ def main(argv: list[str] | None = None) -> None:
         run_dir: Path | None = None
         if ctx.rank == 0:
             run_dir = create_run_dir(run_cfg)
-            logger.add(run_dir / "train.log", level=args.log_level.upper(), enqueue=True)
+            logger.add(
+                run_dir / "train.log",
+                level=args.log_level.upper(),
+                format=LOG_FORMAT,
+                enqueue=True,
+            )
             save_resolved_config(run_cfg, run_dir / "config.toml")
             logger.info("Writing run artifacts to {}", run_dir)
             logger.info(

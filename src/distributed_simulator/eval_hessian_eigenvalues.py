@@ -29,6 +29,7 @@ from distributed_simulator.hessian_eigenvalues import (
     LanczosEigenvalueEstimate,
     lanczos_eigenvalues,
 )
+from distributed_simulator.logging import LOG_FORMAT
 from distributed_simulator.model import ModelName, get_model
 
 DEFAULT_LANCZOS_SEED = 456
@@ -80,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
 def configure_logging(level: str, ctx: ProcessContext) -> None:
     logger.remove()
     if ctx.rank == 0:
-        logger.add(sys.stderr, level=level.upper(), enqueue=True)
+        logger.add(sys.stderr, level=level.upper(), format=LOG_FORMAT, enqueue=True)
 
 
 def main(argv: list[str] | None = None) -> None:
