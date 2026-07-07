@@ -1,3 +1,4 @@
+seed = 42
 [logging]
 save_last_checkpoint = true
 [runtime]
